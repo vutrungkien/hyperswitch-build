@@ -1,5 +1,7 @@
-# Build the Hyperswitch router image = upstream tag (VERSION) + patches/*.patch, using the UPSTREAM Dockerfile with its default
-# build arguments (--features release --features v1), and push ONE manifest to GHCR under TWO tags:
+# Build the Hyperswitch router image = upstream tag (VERSION) + patches/*.patch, using the UPSTREAM Dockerfile (--no-default-features
+# --features release --features v1) plus EXTRA_FEATURES=--features redis-rs: the Dockerfile default ("") does not compile because
+# redis_interface needs exactly one backend and the official v1.126.0 binary was built with redis-rs (crate redis-1.2.0, no fred).
+# Pushes ONE manifest to GHCR under TWO tags:
 #   <IMAGE>:<VERSION>                         deployed by the Helm chart (services.router.version stays the upstream tag: the
 #                                             chart also derives the DB-migration tarball and the Superposition seed URL from it)
 #   <IMAGE>:<VERSION>-mergesk.<PATCHLEVEL>    immutable provenance tag (same digest)
@@ -77,6 +79,7 @@ jobs:
           file: upstream/Dockerfile
           build-args: |
             BINARY=router
+            EXTRA_FEATURES=--features redis-rs
           push: true
           tags: |
             ${{ needs.meta.outputs.image }}:${{ needs.meta.outputs.upstream_tag }}
@@ -118,6 +121,7 @@ jobs:
           build-args: |
             BINARY=scheduler
             SCHEDULER_FLOW=consumer
+            EXTRA_FEATURES=--features redis-rs
           push: true
           tags: |
             ghcr.io/${{ github.repository_owner }}/hyperswitch-consumer:${{ needs.meta.outputs.upstream_tag }}
@@ -135,6 +139,7 @@ jobs:
           build-args: |
             BINARY=scheduler
             SCHEDULER_FLOW=producer
+            EXTRA_FEATURES=--features redis-rs
           push: true
           tags: |
             ghcr.io/${{ github.repository_owner }}/hyperswitch-producer:${{ needs.meta.outputs.upstream_tag }}

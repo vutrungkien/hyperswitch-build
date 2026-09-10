@@ -1,8 +1,10 @@
 # hyperswitch-build
 
 Builds the Hyperswitch **router** container image used by the mergesk self-hosted stack: the official upstream source at the
-tag in `VERSION` plus the patches in `patches/`, built with the **unmodified upstream `Dockerfile` and its default build
-arguments** (`--features release --features v1`, `BINARY=router`), pushed to GHCR as one manifest under two tags:
+tag in `VERSION` plus the patches in `patches/`, built with the **unmodified upstream `Dockerfile`** (`--no-default-features --features release
+--features v1`, `BINARY=router`) plus the build arg `EXTRA_FEATURES=--features redis-rs` (the Dockerfile default `""` does not compile:
+`redis_interface` needs exactly one backend, and the official `v1.126.0` binary was built with `redis-rs` — crate `redis-1.2.0`, no `fred` symbols),
+pushed to GHCR as one manifest under two tags:
 
 ```
 <IMAGE>:<VERSION>                        e.g. ghcr.io/vutrungkien/hyperswitch-router:v1.126.0            (deployed by Helm)
