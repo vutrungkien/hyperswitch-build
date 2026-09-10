@@ -2,8 +2,9 @@
 
 Builds the Hyperswitch **router** container image used by the mergesk self-hosted stack: the official upstream source at the
 tag in `VERSION` plus the patches in `patches/`, built with the **unmodified upstream `Dockerfile`** (`--no-default-features --features release
---features v1`, `BINARY=router`) plus the build arg `EXTRA_FEATURES=--features redis-rs` (the Dockerfile default `""` does not compile:
-`redis_interface` needs exactly one backend, and the official `v1.126.0` binary was built with `redis-rs` — crate `redis-1.2.0`, no `fred` symbols),
+--features v1`, `BINARY=router`) plus the build arg `EXTRA_FEATURES` = `--features redis-rs` (the Dockerfile default `""` does not compile:
+`redis_interface` needs exactly one backend, and the official `v1.126.0` binary was built with `redis-rs` — crate `redis-1.2.0`, no `fred` symbols)
+followed by cargo `--config` overrides of the release profile (see "Build" below),
 pushed to GHCR as one manifest under two tags:
 
 ```
@@ -18,7 +19,9 @@ A tag that does not exist upstream breaks both, so the values keep `version: v1.
 The OCI labels `mergesk.upstream` / `mergesk.patchlevel` say which build a node runs (`crictl inspecti`).
 
 Files: `IMAGE` (registry/repository, must be `ghcr.io/<repo owner>/hyperswitch-router`), `VERSION` (upstream tag),
-`PATCHLEVEL` (integer, bump whenever patch content changes for the same VERSION), `patches/`, `scripts/apply.sh`.
+`PATCHLEVEL` (integer, bump whenever patch content changes for the same VERSION), `EXTRA_FEATURES` (cargo args appended by the
+Dockerfile, one line), `patches/`, `scripts/apply.sh` (apply patches), `scripts/local-build.sh` + `scripts/container-build.sh` (build,
+image, push), `scripts/free-runner-disk.sh` (CI only).
 No secrets live here. The image contains no configuration; the Helm chart injects config exactly as with the official image.
 
 ## Patches
@@ -29,22 +32,52 @@ No secrets live here. The image contains no configuration; the Helm chart inject
 
 Every patch must apply with `git apply --check` on a clean checkout of `VERSION`; `scripts/apply.sh <dir>` applies them all.
 
-## Build (GitHub Actions)
+## Build: `scripts/local-build.sh` (not the free GitHub runner)
 
-- Push to `main` touching `VERSION`, `PATCHLEVEL`, `IMAGE`, `patches/`, `scripts/` or the workflow → job `router` builds and pushes the router image.
-- `Actions → build-hyperswitch → Run workflow` with `build_scheduler=true` also builds `hyperswitch-consumer` and `hyperswitch-producer` from the same source (only needed when a patch touches scheduler code paths).
-- First build takes 1-2 h on the free runner (full Rust release build); later builds reuse the GitHub Actions layer cache.
+The free `ubuntu-latest` runner of a public repo has 4 vCPU / 16 GB RAM. The `router` crate alone needs more than 14 GB during codegen,
+whatever the LTO / codegen-units settings (measured 2026-09-10 in a 14 GiB-capped container: `rustc --crate-name router` OOM-killed at
+13.6 GB while still growing; run 34480081707 died with "The runner has received a shutdown signal"; upstream `docs/try_local_system.md`:
+"up to 24GB"). Decision (mergesk ADR-0015):
+
+- `push` to `main` runs only `patch-check` (every patch applies on a clean checkout of `VERSION`, scripts parse). No image is built in CI.
+- The image is built where the build container can get >= 24 GB (Docker Desktop on Windows: `%USERPROFILE%\.wslconfig` with `memory=26GB`):
+
+  ```
+  git clone --depth 1 -b "$(cat VERSION)" https://github.com/juspay/hyperswitch /path/hs && bash scripts/apply.sh /path/hs
+  GHCR_TOKEN_FILE=/path/github.txt bash scripts/local-build.sh /path/hs all       # build (~1 h) + image + push
+  ```
+
+  - `build`: `scripts/container-build.sh` in `rust:trixie` with `--memory=24g --cpus=8`: the same cargo command as the upstream
+    Dockerfile, `EXTRA_FEATURES` from the file of that name, cargo caches in the named volumes `hs-cargo-registry` / `hs-target`
+    (resumable), memory sampler in `/target/measure.log`, `RESULT` lines with peak RSS / duration / binary size.
+    Measured 2026-09-10 (v1.126.0, 8 jobs): 38 min, `rustc --crate-name router` peaks at 24.1 GB RSS, binary 430 MB, `target/release`
+    8.7 GB — so 24g is the minimum, not a comfortable default. `HS_BUILD_DETACH=1` returns at once (`docker wait hs-local-build`).
+    The `router_env` build script (vergen) watches `/router/.git/`: never run git commands that write into the build tree's `.git`
+    (even `git diff` refreshes the index) or the whole workspace rebuilds; the script reads git info from `/src` with `GIT_OPTIONAL_LOCKS=0`.
+  - `image`: exports `router` + `config/payment_required_fields_v2.toml` to `./out/router/...` and runs the **unmodified upstream
+    `Dockerfile`** with `--build-context builder=./out`: BuildKit replaces the builder stage by that directory, the runtime stage
+    (debian:trixie, user `app`, `RUST_MIN_STACK`, `CMD`) is upstream's. Tags `IMAGE:VERSION` + `IMAGE:VERSION-mergesk.PATCHLEVEL`,
+    labels `org.opencontainers.image.*`, `mergesk.upstream`, `mergesk.patchlevel`.
+  - `push`: `docker login` with the line `ghcr=ghp_...` of `$GHCR_TOKEN_FILE` (classic PAT, scope `write:packages`; GHCR refuses
+    fine-grained PATs: `permission_denied: token does not match expected scopes`), pushes both tags, checks they share one digest, logs out.
+- `workflow_dispatch` with a `runner` label that has >= 24 GB RAM still builds in CI with the same Dockerfile and `EXTRA_FEATURES`
+  (`build_scheduler=true` adds `hyperswitch-consumer` / `hyperswitch-producer`). No GHA layer cache: the `RUN cargo build` layer
+  comes after `COPY . .`, is invalidated by every patch change and exceeds the 10 GB cache limit.
+- `EXTRA_FEATURES` = `--features redis-rs` (required, see top) + cargo `--config profile.release.lto="thin" --config
+  profile.release.codegen-units=16` (upstream: fat LTO, 1 unit). The Dockerfile expands `${EXTRA_FEATURES}` unquoted on the cargo
+  command line, so the overrides ride along without touching the Dockerfile; `--config` has the highest precedence. Same source and
+  features as the official image, only the optimisation profile differs (4x faster build, far less memory).
 - After the first push, make the package **public** (GitHub → Packages → `hyperswitch-router` → Package settings → Change visibility → Public) so the cluster pulls without a pull secret.
 
 ## Upgrade Hyperswitch (new upstream tag)
 
 1. Set `VERSION` to the new upstream tag, reset `PATCHLEVEL` to `1`.
 2. Locally: `git clone --depth 1 -b <tag> https://github.com/juspay/hyperswitch /tmp/hs && bash scripts/apply.sh /tmp/hs` — fix the patch if it no longer applies (rebase, keep the same intent).
-3. Commit + push → build → in mergesk set `hyperswitch-app.services.router.version` to the same tag → `verify-render` → snapshot + `install.sh` per `docs/runbooks/upgrade.md` / `docs/runbooks/router-image.md`.
+3. Commit + push (`patch-check`) → `scripts/local-build.sh <clone> all` → in mergesk set `hyperswitch-app.services.router.version` to the same tag → `verify-render` → snapshot + `install.sh` per `docs/runbooks/upgrade.md` / `docs/runbooks/router-image.md`.
 
 ## Patch-level bump (same upstream tag, patch content changed)
 
-Bump `PATCHLEVEL`, push → the build re-points `<IMAGE>:<VERSION>` to the new digest. The pod spec does not change, so
+Bump `PATCHLEVEL`, push (`patch-check`), run `scripts/local-build.sh <clone> all` → `<IMAGE>:<VERSION>` points to the new digest. The pod spec does not change, so
 `infra/scripts/install.sh` (via `router-image.sh sync`) pulls the tag again on the node and restarts the router when the
 running digest differs — see `docs/runbooks/router-image.md`.
 

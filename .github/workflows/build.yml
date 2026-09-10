@@ -1,20 +1,32 @@
-# Build the Hyperswitch router image = upstream tag (VERSION) + patches/*.patch, using the UPSTREAM Dockerfile (--no-default-features
-# --features release --features v1) plus EXTRA_FEATURES=--features redis-rs: the Dockerfile default ("") does not compile because
-# redis_interface needs exactly one backend and the official v1.126.0 binary was built with redis-rs (crate redis-1.2.0, no fred).
-# Pushes ONE manifest to GHCR under TWO tags:
+# CI of the mergesk Hyperswitch router image (upstream tag VERSION + patches/*.patch).
+#
+# On push: `patch-check` only - checks out juspay/hyperswitch at VERSION and applies every patch (fails loudly when a patch no longer
+# applies, e.g. after a VERSION bump). It does NOT build the image: the free ubuntu-latest runner has 4 vCPU / 16 GB RAM and the
+# `router` crate alone needs more than 14 GB during codegen (measured 2026-09-10; run 34480081707 died with "The runner has received
+# a shutdown signal", upstream docs/try_local_system.md: "up to 24GB"). The image is built by scripts/local-build.sh on a machine with
+# >= 24 GB for the build container (mergesk ADR-0015).
+#
+# On workflow_dispatch with a runner label that has >= 24 GB RAM (`runner` input): builds and pushes the router image with the
+# UNMODIFIED upstream Dockerfile, build arg EXTRA_FEATURES = content of ./EXTRA_FEATURES (--features redis-rs: the Dockerfile default
+# "" does not compile, redis_interface needs one backend and the official image uses redis-rs; plus cargo --config overrides of the
+# release profile, see EXTRA_FEATURES / README). Two tags, one manifest:
 #   <IMAGE>:<VERSION>                         deployed by the Helm chart (services.router.version stays the upstream tag: the
 #                                             chart also derives the DB-migration tarball and the Superposition seed URL from it)
 #   <IMAGE>:<VERSION>-mergesk.<PATCHLEVEL>    immutable provenance tag (same digest)
 # OCI labels mergesk.upstream / mergesk.patchlevel let the node report which build it runs (crictl inspecti).
-# Optionally (workflow_dispatch input) also build the scheduler binary for consumer/producer images from the same source.
+# No GHA layer cache: the RUN cargo build layer sits after COPY . ., is invalidated by every patch change and exceeds the 10 GB cache.
 name: build-hyperswitch
 
 on:
   push:
     branches: [main]
-    paths: [VERSION, PATCHLEVEL, IMAGE, "patches/**", "scripts/**", ".github/workflows/build.yml"]
+    paths: [VERSION, PATCHLEVEL, IMAGE, EXTRA_FEATURES, "patches/**", "scripts/**", ".github/workflows/build.yml"]
   workflow_dispatch:
     inputs:
+      runner:
+        description: "Runner label for the image build (needs >= 24 GB RAM; ubuntu-latest = 16 GB cannot build the router crate)"
+        type: string
+        default: ubuntu-latest
       build_scheduler:
         description: "Also build consumer/producer (scheduler binary)"
         type: boolean
@@ -36,24 +48,45 @@ jobs:
       patchlevel: ${{ steps.v.outputs.patchlevel }}
       image_tag: ${{ steps.v.outputs.image_tag }}
       image: ${{ steps.v.outputs.image }}
+      extra_features: ${{ steps.v.outputs.extra_features }}
     steps:
       - uses: actions/checkout@v4
       - id: v
         run: |
           set -euo pipefail
-          tag=$(tr -d ' \r\n' < VERSION); level=$(tr -d ' \r\n' < PATCHLEVEL); image=$(tr -d ' \r\n' < IMAGE)
+          tag=$(tr -d ' \r\n' < VERSION); level=$(tr -d ' \r\n' < PATCHLEVEL); image=$(tr -d ' \r\n' < IMAGE); extra=$(tr -d '\r\n' < EXTRA_FEATURES)
           [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "bad VERSION: $tag"; exit 1; }
           [[ "$level" =~ ^[0-9]+$ ]] || { echo "bad PATCHLEVEL: $level"; exit 1; }
+          [[ "$extra" == *"--features redis-rs"* ]] || { echo "EXTRA_FEATURES must contain --features redis-rs"; exit 1; }
           owner=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
           [[ "$image" == "ghcr.io/${owner}/hyperswitch-router" ]] || { echo "IMAGE ($image) must be ghcr.io/${owner}/hyperswitch-router: GITHUB_TOKEN can only push packages of the repo owner"; exit 1; }
           echo "upstream_tag=$tag" >> "$GITHUB_OUTPUT"
           echo "patchlevel=$level" >> "$GITHUB_OUTPUT"
           echo "image_tag=${tag}-mergesk.${level}" >> "$GITHUB_OUTPUT"
           echo "image=$image" >> "$GITHUB_OUTPUT"
+          echo "extra_features=$extra" >> "$GITHUB_OUTPUT"
 
-  router:
+  patch-check:
     needs: meta
     runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Checkout upstream Hyperswitch at ${{ needs.meta.outputs.upstream_tag }}
+        uses: actions/checkout@v4
+        with:
+          repository: juspay/hyperswitch
+          ref: ${{ needs.meta.outputs.upstream_tag }}
+          path: upstream
+          fetch-depth: 1
+      - name: Apply patches
+        run: bash scripts/apply.sh upstream
+      - name: Scripts parse
+        run: bash -n scripts/local-build.sh && bash -n scripts/container-build.sh && bash -n scripts/free-runner-disk.sh
+
+  router:
+    if: ${{ github.event_name == 'workflow_dispatch' }}
+    needs: [meta, patch-check]
+    runs-on: ${{ inputs.runner }}
     timeout-minutes: 330
     steps:
       - uses: actions/checkout@v4
@@ -66,6 +99,8 @@ jobs:
           fetch-depth: 1
       - name: Apply patches
         run: bash scripts/apply.sh upstream
+      - name: Free runner disk + log resources
+        run: bash scripts/free-runner-disk.sh
       - uses: docker/setup-buildx-action@v3
       - uses: docker/login-action@v3
         with:
@@ -79,8 +114,9 @@ jobs:
           file: upstream/Dockerfile
           build-args: |
             BINARY=router
-            EXTRA_FEATURES=--features redis-rs
+            EXTRA_FEATURES=${{ needs.meta.outputs.extra_features }}
           push: true
+          provenance: false
           tags: |
             ${{ needs.meta.outputs.image }}:${{ needs.meta.outputs.upstream_tag }}
             ${{ needs.meta.outputs.image }}:${{ needs.meta.outputs.image_tag }}
@@ -90,13 +126,14 @@ jobs:
             org.opencontainers.image.version=${{ needs.meta.outputs.image_tag }}
             mergesk.upstream=${{ needs.meta.outputs.upstream_tag }}
             mergesk.patchlevel=${{ needs.meta.outputs.patchlevel }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+      - name: Disk after build
+        if: always()
+        run: df -h / /mnt; docker system df || true
 
   scheduler:
     if: ${{ github.event_name == 'workflow_dispatch' && inputs.build_scheduler }}
-    needs: meta
-    runs-on: ubuntu-latest
+    needs: [meta, patch-check]
+    runs-on: ${{ inputs.runner }}
     timeout-minutes: 330
     steps:
       - uses: actions/checkout@v4
@@ -107,6 +144,8 @@ jobs:
           path: upstream
           fetch-depth: 1
       - run: bash scripts/apply.sh upstream
+      - name: Free runner disk + log resources
+        run: bash scripts/free-runner-disk.sh
       - uses: docker/setup-buildx-action@v3
       - uses: docker/login-action@v3
         with:
@@ -121,16 +160,15 @@ jobs:
           build-args: |
             BINARY=scheduler
             SCHEDULER_FLOW=consumer
-            EXTRA_FEATURES=--features redis-rs
+            EXTRA_FEATURES=${{ needs.meta.outputs.extra_features }}
           push: true
+          provenance: false
           tags: |
             ghcr.io/${{ github.repository_owner }}/hyperswitch-consumer:${{ needs.meta.outputs.upstream_tag }}
             ghcr.io/${{ github.repository_owner }}/hyperswitch-consumer:${{ needs.meta.outputs.image_tag }}
           labels: |
             mergesk.upstream=${{ needs.meta.outputs.upstream_tag }}
             mergesk.patchlevel=${{ needs.meta.outputs.patchlevel }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
       - name: Build and push producer (scheduler binary, SCHEDULER_FLOW=producer)
         uses: docker/build-push-action@v6
         with:
@@ -139,13 +177,15 @@ jobs:
           build-args: |
             BINARY=scheduler
             SCHEDULER_FLOW=producer
-            EXTRA_FEATURES=--features redis-rs
+            EXTRA_FEATURES=${{ needs.meta.outputs.extra_features }}
           push: true
+          provenance: false
           tags: |
             ghcr.io/${{ github.repository_owner }}/hyperswitch-producer:${{ needs.meta.outputs.upstream_tag }}
             ghcr.io/${{ github.repository_owner }}/hyperswitch-producer:${{ needs.meta.outputs.image_tag }}
           labels: |
             mergesk.upstream=${{ needs.meta.outputs.upstream_tag }}
             mergesk.patchlevel=${{ needs.meta.outputs.patchlevel }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+      - name: Disk after build
+        if: always()
+        run: df -h / /mnt; docker system df || true

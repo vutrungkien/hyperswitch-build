@@ -1,0 +1,1 @@
+--features redis-rs --config profile.release.lto="thin" --config profile.release.codegen-units=16
