@@ -1,0 +1,386 @@
+diff --git a/crates/hyperswitch_connectors/src/connectors/paypal/transformers.rs b/crates/hyperswitch_connectors/src/connectors/paypal/transformers.rs
+index 9d28656..63325b7 100644
+--- a/crates/hyperswitch_connectors/src/connectors/paypal/transformers.rs
++++ b/crates/hyperswitch_connectors/src/connectors/paypal/transformers.rs
+@@ -636,8 +636,190 @@ pub struct PaypalPaymentsRequest {
+     intent: PaypalPaymentIntent,
+     purchase_units: Vec<PurchaseUnitRequest>,
+     payment_source: Option<PaymentSourceItem>,
++    // mergesk patch paypal-payer: buyer details so PayPal prefills the login e-mail and shortens the guest card form
++    #[serde(skip_serializing_if = "Option::is_none")]
++    payer: Option<PaypalPayer>,
++}
++
++// ---- mergesk patch paypal-payer ----------------------------------------------------------------
++// PayPal Orders v2 `payer` object. It is only sent when the connector metadata does not contain
++// `send_payer: false`. PayPal rejects the whole order (422) on malformed payer data, so every part is
++// validated and dropped when unsure (see `build_payer`).
++#[derive(Debug, Serialize, PartialEq, Eq)]
++pub struct PayerName {
++    #[serde(skip_serializing_if = "Option::is_none")]
++    given_name: Option<Secret<String>>,
++    #[serde(skip_serializing_if = "Option::is_none")]
++    surname: Option<Secret<String>>,
++}
++
++#[derive(Debug, Serialize, PartialEq, Eq)]
++pub struct PayerPhoneNumber {
++    national_number: Secret<String>,
++}
++
++#[derive(Debug, Serialize, PartialEq, Eq)]
++pub enum PayerPhoneType {
++    #[serde(rename = "MOBILE")]
++    Mobile,
++}
++
++#[derive(Debug, Serialize, PartialEq, Eq)]
++pub struct PayerPhone {
++    phone_type: PayerPhoneType,
++    phone_number: PayerPhoneNumber,
++}
++
++#[derive(Debug, Serialize, PartialEq, Eq)]
++pub struct PayerAddress {
++    #[serde(skip_serializing_if = "Option::is_none")]
++    address_line_1: Option<Secret<String>>,
++    #[serde(skip_serializing_if = "Option::is_none")]
++    address_line_2: Option<Secret<String>>,
++    #[serde(skip_serializing_if = "Option::is_none")]
++    admin_area_2: Option<String>,
++    #[serde(skip_serializing_if = "Option::is_none")]
++    admin_area_1: Option<Secret<String>>,
++    #[serde(skip_serializing_if = "Option::is_none")]
++    postal_code: Option<Secret<String>>,
++    country_code: enums::CountryAlpha2,
++}
++
++#[derive(Debug, Serialize, PartialEq, Eq)]
++pub struct PaypalPayer {
++    #[serde(skip_serializing_if = "Option::is_none")]
++    email_address: Option<Email>,
++    #[serde(skip_serializing_if = "Option::is_none")]
++    name: Option<PayerName>,
++    #[serde(skip_serializing_if = "Option::is_none")]
++    phone: Option<PayerPhone>,
++    #[serde(skip_serializing_if = "Option::is_none")]
++    address: Option<PayerAddress>,
++}
++
++/// Raw buyer fields as collected from the payment (billing address + e-mail + phone).
++pub struct PayerInput {
++    pub email: Option<Email>,
++    pub first_name: Option<Secret<String>>,
++    pub last_name: Option<Secret<String>>,
++    pub phone: Option<Secret<String>>,
++    pub line1: Option<Secret<String>>,
++    pub line2: Option<Secret<String>>,
++    pub city: Option<String>,
++    pub state: Option<Secret<String>>,
++    pub zip: Option<Secret<String>>,
++    pub country: Option<enums::CountryAlpha2>,
++}
++
++fn clip_secret(value: Option<Secret<String>>, max: usize) -> Option<Secret<String>> {
++    value.and_then(|v| {
++        let trimmed: String = v.expose().trim().chars().take(max).collect();
++        if trimmed.is_empty() {
++            None
++        } else {
++            Some(Secret::new(trimmed))
++        }
++    })
+ }
+ 
++/// Build the PayPal `payer` object, dropping every part that could make PayPal reject the order.
++pub fn build_payer(input: PayerInput) -> Option<PaypalPayer> {
++    let name = match (
++        clip_secret(input.first_name, 140),
++        clip_secret(input.last_name, 140),
++    ) {
++        (None, None) => None,
++        (given_name, surname) => Some(PayerName {
++            given_name,
++            surname,
++        }),
++    };
++    let phone = input.phone.and_then(|p| {
++        let digits: String = p
++            .expose()
++            .chars()
++            .filter(|c| c.is_ascii_digit())
++            .collect();
++        (!digits.is_empty() && digits.len() <= 14).then(|| PayerPhone {
++            phone_type: PayerPhoneType::Mobile,
++            phone_number: PayerPhoneNumber {
++                national_number: Secret::new(digits),
++            },
++        })
++    });
++    let address = input.country.and_then(|country_code| {
++        let admin_area_1 = clip_secret(input.state, 300);
++        let postal_code = clip_secret(input.zip, 60);
++        let needs_state_and_zip = matches!(
++            country_code,
++            enums::CountryAlpha2::US | enums::CountryAlpha2::CA
++        );
++        let state_is_code = admin_area_1
++            .as_ref()
++            .map(|s| s.clone().expose().len() == 2)
++            .unwrap_or(false);
++        if needs_state_and_zip && (postal_code.is_none() || !state_is_code) {
++            return None;
++        }
++        Some(PayerAddress {
++            address_line_1: clip_secret(input.line1, 300),
++            address_line_2: clip_secret(input.line2, 300),
++            admin_area_2: input
++                .city
++                .map(|c| c.trim().chars().take(120).collect::<String>())
++                .filter(|c| !c.is_empty()),
++            admin_area_1,
++            postal_code,
++            country_code,
++        })
++    });
++    if input.email.is_none() && name.is_none() && phone.is_none() && address.is_none() {
++        return None;
++    }
++    Some(PaypalPayer {
++        email_address: input.email,
++        name,
++        phone,
++        address,
++    })
++}
++
++/// Connector metadata `{"send_payer": false}` (or "false"/"off"/"0"/"no") disables the payer block
++/// without a rebuild; anything else (including no metadata) keeps it enabled.
++pub fn payer_enabled(meta: &Option<common_utils::pii::SecretSerdeValue>) -> bool {
++    meta.as_ref()
++        .and_then(|m| m.clone().expose().get("send_payer").cloned())
++        .map_or(true, |v| match v {
++            serde_json::Value::Bool(b) => b,
++            serde_json::Value::String(s) => !matches!(
++                s.trim().to_ascii_lowercase().as_str(),
++                "false" | "off" | "0" | "no"
++            ),
++            _ => true,
++        })
++}
++
++pub fn payer_from_router_data<F, T>(
++    rd: &RouterData<F, T, PaymentsResponseData>,
++) -> Option<PaypalPayer> {
++    if !payer_enabled(&rd.connector_meta_data) {
++        return None;
++    }
++    build_payer(PayerInput {
++        email: rd.get_optional_billing_email(),
++        first_name: rd.get_optional_billing_first_name(),
++        last_name: rd.get_optional_billing_last_name(),
++        phone: rd.get_optional_billing_phone_number(),
++        line1: rd.get_optional_billing_line1(),
++        line2: rd.get_optional_billing_line2(),
++        city: rd.get_optional_billing_city(),
++        state: rd.get_optional_billing_state(),
++        zip: rd.get_optional_billing_zip(),
++        country: rd.get_optional_billing_country(),
++    })
++}
++// ---- end mergesk patch paypal-payer ------------------------------------------------------------
++
+ #[derive(Debug, Serialize)]
+ pub struct PaypalZeroMandateRequest {
+     payment_source: ZeroMandateSourceItem,
+@@ -927,6 +1109,7 @@ impl TryFrom<&PaypalRouterData<&PaymentsPostSessionTokensRouterData>> for Paypal
+             intent,
+             purchase_units,
+             payment_source,
++            payer: payer_from_router_data(item.router_data),
+         })
+     }
+ }
+@@ -1062,6 +1245,7 @@ impl TryFrom<&PaypalRouterData<&PaymentsAuthorizeRouterData>> for PaypalPayments
+                     intent,
+                     purchase_units,
+                     payment_source,
++                    payer: None,
+                 })
+             }
+             PaymentMethodData::Wallet(ref wallet_data) => match wallet_data {
+@@ -1121,6 +1305,7 @@ impl TryFrom<&PaypalRouterData<&PaymentsAuthorizeRouterData>> for PaypalPayments
+                         intent,
+                         purchase_units,
+                         payment_source,
++                        payer: payer_from_router_data(item.router_data),
+                     })
+                 }
+                 WalletData::PaypalSdk(_) => {
+@@ -1163,6 +1348,7 @@ impl TryFrom<&PaypalRouterData<&PaymentsAuthorizeRouterData>> for PaypalPayments
+                         intent,
+                         purchase_units,
+                         payment_source,
++                        payer: payer_from_router_data(item.router_data),
+                     })
+                 }
+                 WalletData::AliPayQr(_)
+@@ -1217,6 +1403,7 @@ impl TryFrom<&PaypalRouterData<&PaymentsAuthorizeRouterData>> for PaypalPayments
+                     intent: bank_redirect_intent,
+                     purchase_units,
+                     payment_source,
++                    payer: None,
+                 })
+             }
+             PaymentMethodData::CardRedirect(ref card_redirect_data) => {
+@@ -1413,6 +1600,7 @@ impl TryFrom<&PaypalRouterData<&PaymentsAuthorizeRouterData>> for PaypalPayments
+                     intent,
+                     purchase_units,
+                     payment_source: payment_source?,
++                    payer: None,
+                 })
+             }
+             PaymentMethodData::Reward
+@@ -4426,3 +4614,142 @@ fn get_paypal_error_message(error_code: &str) -> Option<&str> {
+         _ => None,
+     }
+ }
++
++#[cfg(test)]
++mod payer_tests {
++    // mergesk patch paypal-payer
++    use super::*;
++
++    fn secret(v: &str) -> Option<Secret<String>> {
++        Some(Secret::new(v.to_string()))
++    }
++
++    fn full_us() -> PayerInput {
++        PayerInput {
++            email: Email::try_from("buyer@example.com".to_string()).ok(),
++            first_name: secret("Proto"),
++            last_name: secret("Buyer"),
++            phone: secret("+1 (408) 555-1234"),
++            line1: secret("1 Test Street"),
++            line2: secret(""),
++            city: Some("San Jose".to_string()),
++            state: secret("CA"),
++            zip: secret("95131"),
++            country: Some(enums::CountryAlpha2::US),
++        }
++    }
++
++    #[test]
++    fn full_us_payer_has_all_parts() {
++        let payer = build_payer(full_us()).expect("payer");
++        assert!(payer.email_address.is_some());
++        let name = payer.name.expect("name");
++        assert_eq!(name.given_name.map(|s| s.expose()), Some("Proto".to_string()));
++        assert_eq!(name.surname.map(|s| s.expose()), Some("Buyer".to_string()));
++        assert_eq!(
++            payer.phone.expect("phone").phone_number.national_number.expose(),
++            "14085551234"
++        );
++        let address = payer.address.expect("address");
++        assert_eq!(address.country_code, enums::CountryAlpha2::US);
++        assert_eq!(address.postal_code.map(|s| s.expose()), Some("95131".to_string()));
++        assert_eq!(address.admin_area_1.map(|s| s.expose()), Some("CA".to_string()));
++        assert!(address.address_line_2.is_none(), "empty line2 dropped");
++        assert_eq!(address.admin_area_2, Some("San Jose".to_string()));
++    }
++
++    #[test]
++    fn us_without_zip_drops_address_but_keeps_rest() {
++        let mut input = full_us();
++        input.zip = None;
++        let payer = build_payer(input).expect("payer");
++        assert!(payer.address.is_none());
++        assert!(payer.name.is_some() && payer.email_address.is_some());
++    }
++
++    #[test]
++    fn us_with_long_state_drops_address() {
++        let mut input = full_us();
++        input.state = secret("California");
++        assert!(build_payer(input).expect("payer").address.is_none());
++    }
++
++    #[test]
++    fn non_us_country_without_zip_keeps_address() {
++        let mut input = full_us();
++        input.country = Some(enums::CountryAlpha2::VN);
++        input.zip = None;
++        input.state = secret("Ho Chi Minh");
++        let address = build_payer(input).expect("payer").address.expect("address");
++        assert_eq!(address.country_code, enums::CountryAlpha2::VN);
++        assert!(address.postal_code.is_none());
++    }
++
++    #[test]
++    fn phone_too_long_or_empty_is_dropped() {
++        let mut input = full_us();
++        input.phone = secret("123456789012345");
++        assert!(build_payer(input).expect("payer").phone.is_none());
++        let mut input = full_us();
++        input.phone = secret("+-- ");
++        assert!(build_payer(input).expect("payer").phone.is_none());
++    }
++
++    #[test]
++    fn long_name_is_clipped_to_140() {
++        let mut input = full_us();
++        input.first_name = secret(&"a".repeat(200));
++        let name = build_payer(input).expect("payer").name.expect("name");
++        assert_eq!(name.given_name.map(|s| s.expose().len()), Some(140));
++    }
++
++    #[test]
++    fn empty_input_gives_none() {
++        let input = PayerInput {
++            email: None,
++            first_name: secret("  "),
++            last_name: None,
++            phone: None,
++            line1: None,
++            line2: None,
++            city: None,
++            state: None,
++            zip: None,
++            country: None,
++        };
++        assert!(build_payer(input).is_none());
++    }
++
++    #[test]
++    fn payer_enabled_reads_connector_metadata() {
++        let meta = |v: serde_json::Value| Some(Secret::new(v));
++        assert!(payer_enabled(&None));
++        assert!(payer_enabled(&meta(serde_json::json!({}))));
++        assert!(payer_enabled(&meta(serde_json::json!({"send_payer": true}))));
++        assert!(payer_enabled(&meta(serde_json::json!({"send_payer": "yes"}))));
++        assert!(!payer_enabled(&meta(serde_json::json!({"send_payer": false}))));
++        assert!(!payer_enabled(&meta(serde_json::json!({"send_payer": "off"}))));
++        assert!(!payer_enabled(&meta(serde_json::json!({"send_payer": "false"}))));
++    }
++
++    #[test]
++    fn request_without_payer_has_no_payer_key() {
++        let request = PaypalPaymentsRequest {
++            intent: PaypalPaymentIntent::Capture,
++            purchase_units: vec![],
++            payment_source: None,
++            payer: None,
++        };
++        let json = serde_json::to_string(&request).expect("json");
++        assert!(!json.contains("payer"), "{json}");
++        let request = PaypalPaymentsRequest {
++            intent: PaypalPaymentIntent::Capture,
++            purchase_units: vec![],
++            payment_source: None,
++            payer: build_payer(full_us()),
++        };
++        let json = serde_json::to_string(&request).expect("json");
++        assert!(json.contains("\"payer\":{\"email_address\":\"buyer@example.com\""), "{json}");
++        assert!(json.contains("\"phone_type\":\"MOBILE\""), "{json}");
++    }
++}

@@ -1,0 +1,146 @@
+# Build the Hyperswitch router image = upstream tag (VERSION) + patches/*.patch, using the UPSTREAM Dockerfile with its default
+# build arguments (--features release --features v1), and push ONE manifest to GHCR under TWO tags:
+#   <IMAGE>:<VERSION>                         deployed by the Helm chart (services.router.version stays the upstream tag: the
+#                                             chart also derives the DB-migration tarball and the Superposition seed URL from it)
+#   <IMAGE>:<VERSION>-mergesk.<PATCHLEVEL>    immutable provenance tag (same digest)
+# OCI labels mergesk.upstream / mergesk.patchlevel let the node report which build it runs (crictl inspecti).
+# Optionally (workflow_dispatch input) also build the scheduler binary for consumer/producer images from the same source.
+name: build-hyperswitch
+
+on:
+  push:
+    branches: [main]
+    paths: [VERSION, PATCHLEVEL, IMAGE, "patches/**", "scripts/**", ".github/workflows/build.yml"]
+  workflow_dispatch:
+    inputs:
+      build_scheduler:
+        description: "Also build consumer/producer (scheduler binary)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  meta:
+    runs-on: ubuntu-latest
+    outputs:
+      upstream_tag: ${{ steps.v.outputs.upstream_tag }}
+      patchlevel: ${{ steps.v.outputs.patchlevel }}
+      image_tag: ${{ steps.v.outputs.image_tag }}
+      image: ${{ steps.v.outputs.image }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: v
+        run: |
+          set -euo pipefail
+          tag=$(tr -d ' \r\n' < VERSION); level=$(tr -d ' \r\n' < PATCHLEVEL); image=$(tr -d ' \r\n' < IMAGE)
+          [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "bad VERSION: $tag"; exit 1; }
+          [[ "$level" =~ ^[0-9]+$ ]] || { echo "bad PATCHLEVEL: $level"; exit 1; }
+          owner=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          [[ "$image" == "ghcr.io/${owner}/hyperswitch-router" ]] || { echo "IMAGE ($image) must be ghcr.io/${owner}/hyperswitch-router: GITHUB_TOKEN can only push packages of the repo owner"; exit 1; }
+          echo "upstream_tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "patchlevel=$level" >> "$GITHUB_OUTPUT"
+          echo "image_tag=${tag}-mergesk.${level}" >> "$GITHUB_OUTPUT"
+          echo "image=$image" >> "$GITHUB_OUTPUT"
+
+  router:
+    needs: meta
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    steps:
+      - uses: actions/checkout@v4
+      - name: Checkout upstream Hyperswitch at ${{ needs.meta.outputs.upstream_tag }}
+        uses: actions/checkout@v4
+        with:
+          repository: juspay/hyperswitch
+          ref: ${{ needs.meta.outputs.upstream_tag }}
+          path: upstream
+          fetch-depth: 1
+      - name: Apply patches
+        run: bash scripts/apply.sh upstream
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build and push router (tags ${{ needs.meta.outputs.upstream_tag }} + ${{ needs.meta.outputs.image_tag }})
+        uses: docker/build-push-action@v6
+        with:
+          context: upstream
+          file: upstream/Dockerfile
+          build-args: |
+            BINARY=router
+          push: true
+          tags: |
+            ${{ needs.meta.outputs.image }}:${{ needs.meta.outputs.upstream_tag }}
+            ${{ needs.meta.outputs.image }}:${{ needs.meta.outputs.image_tag }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.description=Hyperswitch router ${{ needs.meta.outputs.upstream_tag }} + mergesk patches (patchlevel ${{ needs.meta.outputs.patchlevel }})
+            org.opencontainers.image.version=${{ needs.meta.outputs.image_tag }}
+            mergesk.upstream=${{ needs.meta.outputs.upstream_tag }}
+            mergesk.patchlevel=${{ needs.meta.outputs.patchlevel }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  scheduler:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.build_scheduler }}
+    needs: meta
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: juspay/hyperswitch
+          ref: ${{ needs.meta.outputs.upstream_tag }}
+          path: upstream
+          fetch-depth: 1
+      - run: bash scripts/apply.sh upstream
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build and push consumer (scheduler binary, SCHEDULER_FLOW=consumer)
+        uses: docker/build-push-action@v6
+        with:
+          context: upstream
+          file: upstream/Dockerfile
+          build-args: |
+            BINARY=scheduler
+            SCHEDULER_FLOW=consumer
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/hyperswitch-consumer:${{ needs.meta.outputs.upstream_tag }}
+            ghcr.io/${{ github.repository_owner }}/hyperswitch-consumer:${{ needs.meta.outputs.image_tag }}
+          labels: |
+            mergesk.upstream=${{ needs.meta.outputs.upstream_tag }}
+            mergesk.patchlevel=${{ needs.meta.outputs.patchlevel }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Build and push producer (scheduler binary, SCHEDULER_FLOW=producer)
+        uses: docker/build-push-action@v6
+        with:
+          context: upstream
+          file: upstream/Dockerfile
+          build-args: |
+            BINARY=scheduler
+            SCHEDULER_FLOW=producer
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository_owner }}/hyperswitch-producer:${{ needs.meta.outputs.upstream_tag }}
+            ghcr.io/${{ github.repository_owner }}/hyperswitch-producer:${{ needs.meta.outputs.image_tag }}
+          labels: |
+            mergesk.upstream=${{ needs.meta.outputs.upstream_tag }}
+            mergesk.patchlevel=${{ needs.meta.outputs.patchlevel }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
