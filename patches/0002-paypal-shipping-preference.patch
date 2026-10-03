@@ -1,0 +1,157 @@
+diff --git a/crates/hyperswitch_connectors/src/connectors/paypal/transformers.rs b/crates/hyperswitch_connectors/src/connectors/paypal/transformers.rs
+--- a/crates/hyperswitch_connectors/src/connectors/paypal/transformers.rs
++++ b/crates/hyperswitch_connectors/src/connectors/paypal/transformers.rs
+@@ -54,7 +54,7 @@ use hyperswitch_interfaces::{
+     consts::{NO_ERROR_CODE, NO_ERROR_MESSAGE},
+     errors,
+ };
+-use hyperswitch_masking::{ExposeInterface, Secret};
++use hyperswitch_masking::{ExposeInterface, PeekInterface, Secret};
+ use serde::{Deserialize, Serialize};
+ use time::PrimitiveDateTime;
+ use url::Url;
+@@ -955,6 +955,126 @@ fn get_address_info(
+         None => None,
+     }
+ }
++
++// ---- mergesk patch paypal-shipping-preference ---------------------------------------------------
++// Upstream hard-codes `GET_FROM_FILE` for the PayPal JS SDK order (PostSessionTokens), so PayPal collects a
++// shipping address of its own instead of using the one on the merchant order. `SET_PROVIDED_ADDRESS` is only
++// safe when the address actually serialized is complete: PayPal answers 422 otherwise - MISSING_SHIPPING_ADDRESS
++// (no address), POSTAL_CODE_REQUIRED (missing or blank postal code) or CITY_REQUIRED (blank city) - measured
++// against the PayPal sandbox on 2026-09-12. Countries that need no postal code (HK, IE, AE, VN...) keep the
++// upstream value, which PayPal accepts in every case.
++fn shipping_preference_for(shipping: &ShippingAddress) -> ShippingPreference {
++    let filled = |value: &Option<Secret<String>>| {
++        value
++            .as_ref()
++            .is_some_and(|value| !value.peek().trim().is_empty())
++    };
++    let complete = shipping.address.as_ref().is_some_and(|address| {
++        filled(&address.postal_code)
++            && address
++                .admin_area_2
++                .as_ref()
++                .is_some_and(|city| !city.trim().is_empty())
++    });
++    if complete {
++        ShippingPreference::SetProvidedAddress
++    } else {
++        ShippingPreference::GetFromFile
++    }
++}
++
++// Tests live next to the helper (not at the end of the file) so that every mergesk patch keeps applying and
++// reverse-applying on its own, whatever order they are stacked in.
++#[cfg(test)]
++mod shipping_preference_tests {
++    use super::*;
++
++    fn shipping(line1: Option<&str>, city: Option<&str>, zip: Option<&str>) -> ShippingAddress {
++        ShippingAddress {
++            address: Some(Address {
++                address_line_1: line1.map(|v| Secret::new(v.to_string())),
++                postal_code: zip.map(|v| Secret::new(v.to_string())),
++                country_code: enums::CountryAlpha2::US,
++                admin_area_2: city.map(|v| v.to_string()),
++                // later mergesk patches may add fields to `Address`; this literal must keep compiling
++                ..Default::default()
++            }),
++            name: None,
++        }
++    }
++
++    #[test]
++    fn complete_address_uses_provided_address() {
++        assert!(matches!(
++            shipping_preference_for(&shipping(Some("1 Test Street"), Some("San Jose"), Some("95131"))),
++            ShippingPreference::SetProvidedAddress
++        ));
++        // PayPal accepts a missing street line, so it must not block the switch
++        assert!(matches!(
++            shipping_preference_for(&shipping(None, Some("San Jose"), Some("95131"))),
++            ShippingPreference::SetProvidedAddress
++        ));
++    }
++
++    #[test]
++    fn missing_or_blank_postal_code_keeps_get_from_file() {
++        for zip in [None, Some(""), Some("   ")] {
++            assert!(
++                matches!(
++                    shipping_preference_for(&shipping(Some("1 Test Street"), Some("San Jose"), zip)),
++                    ShippingPreference::GetFromFile
++                ),
++                "zip {zip:?}"
++            );
++        }
++    }
++
++    #[test]
++    fn missing_or_blank_city_keeps_get_from_file() {
++        for city in [None, Some(""), Some(" ")] {
++            assert!(
++                matches!(
++                    shipping_preference_for(&shipping(Some("1 Test Street"), city, Some("95131"))),
++                    ShippingPreference::GetFromFile
++                ),
++                "city {city:?}"
++            );
++        }
++    }
++
++    #[test]
++    fn no_address_keeps_get_from_file() {
++        let empty = ShippingAddress {
++            address: None,
++            name: None,
++        };
++        assert!(matches!(
++            shipping_preference_for(&empty),
++            ShippingPreference::GetFromFile
++        ));
++        assert!(matches!(
++            shipping_preference_for(&ShippingAddress::default()),
++            ShippingPreference::GetFromFile
++        ));
++    }
++
++    #[test]
++    fn serialized_value_matches_paypal_field() {
++        let json = serde_json::to_string(&ContextStruct {
++            return_url: None,
++            cancel_url: None,
++            user_action: Some(UserAction::PayNow),
++            shipping_preference: shipping_preference_for(&shipping(
++                Some("1 Test Street"),
++                Some("San Jose"),
++                Some("95131"),
++            )),
++        })
++        .expect("json");
++        assert!(json.contains("\"shipping_preference\":\"SET_PROVIDED_ADDRESS\""), "{json}");
++    }
++}
++
+ fn get_payment_source(
+     item: &PaymentsAuthorizeRouterData,
+     bank_redirection_data: &BankRedirectData,
+@@ -1069,6 +1189,8 @@ impl TryFrom<&PaypalRouterData<&PaymentsPostSessionTokensRouterData>> for Paypal
+             item.router_data.connector_request_reference_id.clone();
+ 
+         let shipping_address = ShippingAddress::from(item);
++        // mergesk patch paypal-shipping-preference: follow the address we send instead of always GET_FROM_FILE
++        let shipping_preference = shipping_preference_for(&shipping_address);
+         let item_details = vec![ItemDetails::try_from(item)?];
+ 
+         let purchase_units = vec![PurchaseUnitRequest {
+@@ -1085,7 +1207,7 @@ impl TryFrom<&PaypalRouterData<&PaymentsPostSessionTokensRouterData>> for Paypal
+                 experience_context: ContextStruct {
+                     return_url: item.router_data.request.router_return_url.clone(),
+                     cancel_url: item.router_data.request.router_return_url.clone(),
+-                    shipping_preference: ShippingPreference::GetFromFile,
++                    shipping_preference,
+                     user_action: Some(UserAction::PayNow),
+                 },
+                 attributes: match item.router_data.request.setup_future_usage {

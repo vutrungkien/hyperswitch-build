@@ -1,0 +1,192 @@
+diff --git a/crates/hyperswitch_connectors/src/connectors/paypal/transformers.rs b/crates/hyperswitch_connectors/src/connectors/paypal/transformers.rs
+--- a/crates/hyperswitch_connectors/src/connectors/paypal/transformers.rs
++++ b/crates/hyperswitch_connectors/src/connectors/paypal/transformers.rs
+@@ -370,6 +370,9 @@ pub struct Address {
+     postal_code: Option<Secret<String>>,
+     country_code: enums::CountryAlpha2,
+     admin_area_2: Option<String>,
++    // mergesk patch paypal-shipping-address-quality: state / province, left out when blank
++    #[serde(skip_serializing_if = "Option::is_none")]
++    admin_area_1: Option<Secret<String>>,
+ }
+ 
+ #[derive(Default, Debug, Serialize, Eq, PartialEq)]
+@@ -383,11 +386,7 @@ impl From<&PaypalRouterData<&PaymentsAuthorizeRouterData>> for ShippingAddress {
+         Self {
+             address: get_address_info(item.router_data.get_optional_shipping()),
+             name: Some(ShippingName {
+-                full_name: item
+-                    .router_data
+-                    .get_optional_shipping()
+-                    .and_then(|inner_data| inner_data.address.as_ref())
+-                    .and_then(|inner_data| inner_data.first_name.clone()),
++                full_name: shipping_full_name(item.router_data.get_optional_shipping()),
+             }),
+         }
+     }
+@@ -398,16 +397,152 @@ impl From<&PaypalRouterData<&PaymentsPostSessionTokensRouterData>> for ShippingA
+         Self {
+             address: get_address_info(item.router_data.get_optional_shipping()),
+             name: Some(ShippingName {
+-                full_name: item
+-                    .router_data
+-                    .get_optional_shipping()
+-                    .and_then(|inner_data| inner_data.address.as_ref())
+-                    .and_then(|inner_data| inner_data.first_name.clone()),
++                full_name: shipping_full_name(item.router_data.get_optional_shipping()),
+             }),
+         }
+     }
+ }
+ 
++// ---- mergesk patch paypal-shipping-address-quality ----------------------------------------------
++// Upstream sends only the first name as `shipping.name.full_name` and never the state, so a PayPal
++// transaction shows "huhu" for the buyer "huhu hihi" and an address without its state (measured on a real
++// order, 2026-09-12). PayPal accepts any `admin_area_1` text - "TX", "texas", "ZZ", "Ho Chi Minh" and ""
++// all answered 200 on the sandbox that day - but a blank one is left out anyway. Both values are cut at
++// PayPal's limit of 300 characters.
++fn shipping_full_name(
++    shipping: Option<&hyperswitch_domain_models::address::Address>,
++) -> Option<Secret<String>> {
++    let details = shipping.and_then(|shipping| shipping.address.as_ref())?;
++    let joined = [details.first_name.clone(), details.last_name.clone()]
++        .into_iter()
++        .flatten()
++        .map(|part| part.expose())
++        .collect::<Vec<String>>()
++        .join(" ");
++    let full_name = joined.split_whitespace().collect::<Vec<&str>>().join(" ");
++    let full_name = full_name.chars().take(300).collect::<String>();
++    let full_name = full_name.trim_end();
++    (!full_name.is_empty()).then(|| Secret::new(full_name.to_string()))
++}
++
++fn address_state(state: Option<&Secret<String>>) -> Option<Secret<String>> {
++    let state = state?.clone().expose();
++    let state = state.trim().chars().take(300).collect::<String>();
++    (!state.is_empty()).then(|| Secret::new(state))
++}
++
++// Tests live next to the helpers (not at the end of the file) so that every mergesk patch keeps applying and
++// reverse-applying on its own.
++#[cfg(test)]
++mod shipping_address_quality_tests {
++    use hyperswitch_domain_models::address::{Address as DomainAddress, AddressDetails};
++
++    use super::*;
++
++    fn secret(value: Option<&str>) -> Option<Secret<String>> {
++        value.map(|v| Secret::new(v.to_string()))
++    }
++
++    fn domain(first: Option<&str>, last: Option<&str>, state: Option<&str>) -> DomainAddress {
++        DomainAddress {
++            address: Some(AddressDetails {
++                city: Some("Katy".to_string()),
++                country: Some(enums::CountryAlpha2::US),
++                line1: secret(Some("1 Test Street")),
++                zip: secret(Some("77494")),
++                state: secret(state),
++                first_name: secret(first),
++                last_name: secret(last),
++                ..Default::default()
++            }),
++            ..Default::default()
++        }
++    }
++
++    fn name_of(first: Option<&str>, last: Option<&str>) -> Option<String> {
++        shipping_full_name(Some(&domain(first, last, None))).map(|name| name.expose())
++    }
++
++    #[test]
++    fn full_name_joins_first_and_last_name() {
++        assert_eq!(name_of(Some("huhu"), Some("hihi")), Some("huhu hihi".to_string()));
++        assert_eq!(name_of(Some("  Mary  Ann "), Some(" Van  Dyke ")), Some("Mary Ann Van Dyke".to_string()));
++    }
++
++    #[test]
++    fn full_name_uses_the_part_that_exists() {
++        assert_eq!(name_of(Some("huhu"), None), Some("huhu".to_string()));
++        assert_eq!(name_of(None, Some("hihi")), Some("hihi".to_string()));
++        assert_eq!(name_of(Some("huhu"), Some("   ")), Some("huhu".to_string()));
++        assert_eq!(name_of(Some(""), Some("hihi")), Some("hihi".to_string()));
++    }
++
++    #[test]
++    fn full_name_is_none_when_nothing_usable() {
++        assert_eq!(name_of(None, None), None);
++        assert_eq!(name_of(Some(""), Some("  ")), None);
++        assert!(shipping_full_name(None).is_none());
++        assert!(shipping_full_name(Some(&DomainAddress::default())).is_none());
++    }
++
++    #[test]
++    fn full_name_is_cut_at_300_characters() {
++        let long = "a".repeat(299);
++        let name = name_of(Some(&long), Some("bcd")).expect("name");
++        assert_eq!(name.chars().count(), 299, "cut after the separator, trailing blank removed: {name}");
++        let name = name_of(Some(&"a".repeat(200)), Some(&"b".repeat(200))).expect("name");
++        assert_eq!(name.chars().count(), 300);
++    }
++
++    #[test]
++    fn state_is_sent_trimmed_and_left_out_when_blank() {
++        let state_of = |state: Option<&str>| {
++            get_address_info(Some(&domain(Some("huhu"), Some("hihi"), state)))
++                .expect("address")
++                .admin_area_1
++                .map(|state| state.expose())
++        };
++        assert_eq!(state_of(Some("TX")), Some("TX".to_string()));
++        assert_eq!(state_of(Some("  Ho Chi Minh ")), Some("Ho Chi Minh".to_string()));
++        for blank in [None, Some(""), Some("   ")] {
++            assert_eq!(state_of(blank), None, "state {blank:?}");
++        }
++        assert_eq!(state_of(Some(&"x".repeat(400))).map(|state| state.len()), Some(300));
++    }
++
++    #[test]
++    fn other_address_fields_are_unchanged() {
++        let address = get_address_info(Some(&domain(Some("huhu"), Some("hihi"), Some("TX")))).expect("address");
++        assert_eq!(address.address_line_1.map(|v| v.expose()), Some("1 Test Street".to_string()));
++        assert_eq!(address.postal_code.map(|v| v.expose()), Some("77494".to_string()));
++        assert_eq!(address.admin_area_2, Some("Katy".to_string()));
++        assert_eq!(address.country_code, enums::CountryAlpha2::US);
++        let mut no_country = domain(Some("huhu"), Some("hihi"), Some("TX"));
++        if let Some(details) = no_country.address.as_mut() {
++            details.country = None;
++        }
++        assert!(get_address_info(Some(&no_country)).is_none(), "no country -> no address, as upstream");
++    }
++
++    #[test]
++    fn serialized_shipping_carries_state_and_full_name() {
++        let shipping = |state: Option<&str>| ShippingAddress {
++            address: get_address_info(Some(&domain(Some("huhu"), Some("hihi"), state))),
++            name: Some(ShippingName {
++                full_name: shipping_full_name(Some(&domain(Some("huhu"), Some("hihi"), state))),
++            }),
++        };
++        let json = serde_json::to_value(shipping(Some("TX"))).expect("json");
++        assert_eq!(json["address"]["admin_area_1"], "TX");
++        assert_eq!(json["address"]["admin_area_2"], "Katy");
++        assert_eq!(json["address"]["postal_code"], "77494");
++        assert_eq!(json["address"]["country_code"], "US");
++        assert_eq!(json["name"]["full_name"], "huhu hihi");
++        let json = serde_json::to_value(shipping(Some(" "))).expect("json");
++        assert!(json["address"].get("admin_area_1").is_none(), "blank state must not be serialized: {json}");
++    }
++}
++
+ #[derive(Debug, Serialize, PartialEq, Eq)]
+ pub struct PaypalUpdateOrderRequest(Vec<Operation>);
+ 
+@@ -951,6 +1086,7 @@ fn get_address_info(
+             address_line_1: address.line1.clone(),
+             postal_code: address.zip.clone(),
+             admin_area_2: address.city.clone(),
++            admin_area_1: address_state(address.state.as_ref()),
+         }),
+         None => None,
+     }

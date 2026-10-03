@@ -22,6 +22,9 @@ export MSYS_NO_PATHCONV=1
 IMAGE=$(tr -d ' \r\n' < "$HERE/IMAGE"); VERSION=$(tr -d ' \r\n' < "$HERE/VERSION"); PATCHLEVEL=$(tr -d ' \r\n' < "$HERE/PATCHLEVEL")
 EXTRA_FEATURES=$(tr -d '\r\n' < "$HERE/EXTRA_FEATURES")
 MEM="${HS_BUILD_MEMORY:-24g}"; CPUS="${HS_BUILD_CPUS:-8}"; JOBS="${HS_BUILD_JOBS:-$CPUS}"
+# Mac dinh cam swap (swap = memory) nhu truoc; dat HS_BUILD_MEMORY_SWAP lon hon de rustc tran sang swap thay vi bi OOM-kill
+# (2026-09-12: crate `router` dinh SIGKILL o 23,7 GB voi tran 24g tren VM 25,4 GiB -> 22g + swap 32g qua duoc).
+MEM_SWAP="${HS_BUILD_MEMORY_SWAP:-$MEM}"
 REG_VOL="${HS_CARGO_REGISTRY_VOLUME:-hs-cargo-registry}"; TGT_VOL="${HS_TARGET_VOLUME:-hs-target}"
 OWNER=$(echo "$IMAGE" | cut -d/ -f2); REGISTRY=${IMAGE%%/*}
 SOURCE_URL="${HS_SOURCE_URL:-https://github.com/$OWNER/hyperswitch-build}"
@@ -32,7 +35,9 @@ SRC_W=$(winpath "$(cd "$SRC" && pwd)"); HERE_W=$(winpath "$HERE"); OUT_W=$(winpa
 # sanity: upstream checkout is at VERSION and carries every patch (each patch must apply in reverse)
 git -C "$SRC" tag --points-at HEAD | grep -qx "$VERSION" || { echo "FAIL $SRC is not at upstream tag $VERSION"; exit 1; }
 for p in "$HERE"/patches/*.patch; do
-  git -C "$SRC" -c core.autocrlf=false apply --check -R "$p" >/dev/null 2>&1 || { echo "FAIL patch not applied in $SRC: $(basename "$p") (run scripts/apply.sh)"; exit 1; }
+  # winpath: MSYS_NO_PATHCONV=1 (set above for docker) stops Git Bash from turning /c/... into C:/... for git.exe,
+  # and git then answers "can't open patch" (exit 128) -> the check would report every patch as missing.
+  git -C "$SRC" -c core.autocrlf=false apply --check -R "$(winpath "$p")" >/dev/null 2>&1 || { echo "FAIL patch not applied in $SRC: $(basename "$p") (run scripts/apply.sh)"; exit 1; }
 done
 echo "source $SRC_W = $VERSION + $(ls "$HERE"/patches/*.patch | wc -l | tr -d ' ') patch(es) -> $TAG_UP + $TAG_PL"
 
@@ -40,7 +45,7 @@ build() {
   docker rm -f hs-local-build >/dev/null 2>&1 || true
   echo "build: rust:trixie --cpus=$CPUS --memory=$MEM jobs=$JOBS EXTRA_FEATURES=$EXTRA_FEATURES"
   local detach=(); [ "${HS_BUILD_DETACH:-0}" = 1 ] && detach=(-d)
-  docker run "${detach[@]}" --name hs-local-build --cpus="$CPUS" --memory="$MEM" --memory-swap="$MEM" \
+  docker run "${detach[@]}" --name hs-local-build --cpus="$CPUS" --memory="$MEM" --memory-swap="$MEM_SWAP" \
     -v "$SRC_W:/src:ro" -v "$REG_VOL:/usr/local/cargo/registry" -v "$TGT_VOL:/target" -v "$HERE_W/scripts:/build-scripts:ro" \
     -e CARGO_INCREMENTAL=0 -e CARGO_NET_RETRY=10 -e RUSTUP_MAX_RETRIES=10 -e RUST_BACKTRACE=short \
     -e CARGO_BUILD_JOBS="$JOBS" -e CARGO_TARGET_DIR=/target -e EXTRA_FEATURES="$EXTRA_FEATURES" \

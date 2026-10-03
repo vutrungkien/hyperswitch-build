@@ -29,8 +29,13 @@ No secrets live here. The image contains no configuration; the Helm chart inject
 | File | What | Why |
 |---|---|---|
 | `patches/0001-paypal-payer.patch` | PayPal connector sends the `payer` object (e-mail, name, phone, billing address) when creating an order (`POST /v2/checkout/orders`) in the redirect and SDK flows. Off per connector with connector metadata `{"send_payer": false}`. | PayPal prefills the login e-mail and shortens the guest "Debit or Credit Card" form to card number / expiry / CSC. Upstream does not send `payer`; PayPal refuses `PATCH /payer`. |
+| `patches/0002-paypal-shipping-preference.patch` | The PayPal JS SDK order (`PostSessionTokens`) sends `experience_context.shipping_preference = SET_PROVIDED_ADDRESS` when the shipping address actually serialized has a postal code and a city, instead of the hard-coded `GET_FROM_FILE`. | PayPal otherwise asks the buyer for a shipping address of its own, which can differ from the merchant order and voids Seller Protection. The condition mirrors what PayPal validates (422 `MISSING_SHIPPING_ADDRESS` / `POSTAL_CODE_REQUIRED` / `CITY_REQUIRED`, measured on the sandbox 2026-09-12); a state (`admin_area_1`) is not required. |
+| `patches/0003-paypal-shipping-address-quality.patch` | The PayPal address object (`shipping.address` of every PayPal flow and `billing_address` of the card flow, one shared struct) carries the state as `admin_area_1`, trimmed, cut at 300 characters and left out when blank; `shipping.name.full_name` is first name + last name (single blanks, whichever part exists) instead of the first name only. | A real order showed the recipient as `huhu` for the buyer `huhu hihi` and an address without its state: PayPal's Seller Protection is tied to shipping to the address on the transaction. PayPal accepts any `admin_area_1` text (`TX`, `texas`, `ZZ`, `Ho Chi Minh`, empty: all 200 on the sandbox, 2026-09-12). |
 
 Every patch must apply with `git apply --check` on a clean checkout of `VERSION`; `scripts/apply.sh <dir>` applies them all.
+Every patch must also reverse-apply on the fully patched tree (`scripts/local-build.sh` refuses to build otherwise), so a patch never edits a line another patch added:
+new code and its test module go next to what they change (not at the end of the file), and a test that builds a struct literal of a type a later patch may extend ends it with
+`..Default::default()` (patch 0002's test helper, changed for exactly that reason when 0003 added `Address.admin_area_1`).
 
 ## Build: `scripts/local-build.sh` (not the free GitHub runner)
 
@@ -87,10 +92,10 @@ Set `services.router` in the Helm values back to the official image (`imageRegis
 
 ## Local check of a patch (optional)
 
-The connector crate needs the same features the router release build enables for it (`payouts`, `frm`; `worldpayxml` does not compile without `payouts`):
+The connector crate needs the same features the router release build enables for it (`payouts`, `frm`; `worldpayxml` does not compile without `payouts`). `MSYS_NO_PATHCONV=1` stops Git Bash on Windows from rewriting `-w /src` into `C:/Program Files/Git/src`; elsewhere it is ignored:
 
 ```
-docker run --rm -v "$PWD/upstream:/src" -v hs-cargo-registry:/usr/local/cargo/registry -w /src rust:trixie \
+MSYS_NO_PATHCONV=1 docker run --rm -v "$PWD/upstream:/src" -v hs-cargo-registry:/usr/local/cargo/registry -w /src rust:trixie \
   bash -c "apt-get update -qq && apt-get install -y -qq libpq-dev libssl-dev pkg-config protobuf-compiler >/dev/null; \
-           cargo test -p hyperswitch_connectors --features 'v1 payouts frm' payer_tests"
+           cargo test -p hyperswitch_connectors --features 'v1 payouts frm' paypal::transformers"
 ```
