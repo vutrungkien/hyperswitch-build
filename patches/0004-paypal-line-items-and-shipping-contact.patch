@@ -1,0 +1,737 @@
+diff --git a/crates/hyperswitch_connectors/src/connectors/paypal/transformers.rs b/crates/hyperswitch_connectors/src/connectors/paypal/transformers.rs
+--- a/crates/hyperswitch_connectors/src/connectors/paypal/transformers.rs
++++ b/crates/hyperswitch_connectors/src/connectors/paypal/transformers.rs
+@@ -12,7 +12,12 @@ use base64::Engine;
+ use common_enums::enums as storage_enums;
+ #[cfg(feature = "payouts")]
+ use common_utils::pii::Email;
+-use common_utils::{consts, errors::CustomResult, request::Method, types::StringMajorUnit};
++use common_utils::{
++    consts,
++    errors::CustomResult,
++    request::Method,
++    types::{MinorUnit, StringMajorUnit, StringMajorUnitForConnector},
++};
+ use error_stack::ResultExt;
+ use hyperswitch_domain_models::{
+     payment_method_data::{
+@@ -38,7 +43,7 @@ use hyperswitch_domain_models::{
+         VerifyWebhookSourceResponseData, VerifyWebhookStatus,
+     },
+     types::{
+-        PaymentsAuthorizeRouterData, PaymentsCaptureRouterData,
++        OrderDetailsWithAmount, PaymentsAuthorizeRouterData, PaymentsCaptureRouterData,
+         PaymentsExtendAuthorizationRouterData, PaymentsIncrementalAuthorizationRouterData,
+         PaymentsPostSessionTokensRouterData, PaymentsSessionRouterData, PaymentsSyncRouterData,
+         RefreshTokenRouterData, RefundsRouterData, SdkSessionUpdateRouterData,
+@@ -192,6 +197,8 @@ impl From<&PaypalRouterData<&PaymentsAuthorizeRouterData>> for OrderRequestAmoun
+                         .clone()
+                         .unwrap_or(StringMajorUnit::zero()),
+                 }),
++                handling: None,
++                discount: None,
+             },
+         }
+     }
+@@ -222,6 +229,8 @@ impl TryFrom<&PaypalRouterData<&PaymentsPostSessionTokensRouterData>> for OrderR
+                         .clone()
+                         .unwrap_or(StringMajorUnit::zero()),
+                 }),
++                handling: None,
++                discount: None,
+             },
+         })
+     }
+@@ -257,6 +266,8 @@ impl TryFrom<&PaypalRouterData<&SdkSessionUpdateRouterData>> for OrderRequestAmo
+                         .clone()
+                         .unwrap_or(StringMajorUnit::zero()),
+                 }),
++                handling: None,
++                discount: None,
+             },
+         })
+     }
+@@ -267,6 +278,11 @@ pub struct AmountBreakdown {
+     item_total: OrderAmount,
+     tax_total: Option<OrderAmount>,
+     shipping: Option<OrderAmount>,
++    // mergesk patch paypal-line-items (plan 32): fees + rounding remainder, and discounts; left out when absent
++    #[serde(skip_serializing_if = "Option::is_none")]
++    handling: Option<OrderAmount>,
++    #[serde(skip_serializing_if = "Option::is_none")]
++    discount: Option<OrderAmount>,
+ }
+ 
+ #[derive(Default, Debug, Serialize, Eq, PartialEq)]
+@@ -277,10 +293,557 @@ pub struct PurchaseUnitRequest {
+     amount: OrderRequestAmount,
+     #[serde(skip_serializing_if = "Option::is_none")]
+     payee: Option<Payee>,
+-    shipping: Option<ShippingAddress>,
++    shipping: Option<ShippingDetails>,
+     items: Vec<ItemDetails>,
+ }
+ 
++// ---- mergesk patch paypal-line-items (plan 32) --------------------------------------------------
++// Upstream sends one item "Payment for invoice <ref>" (quantity 1) and puts the whole amount into
++// `item_total` - in the popup/redirect flow even when `shipping_cost` is set, which PayPal would refuse with
++// 422 once a real shipping value is present. The merchant plugin now sends `order_details`: product lines
++// (quantity, floor unit price, `total_amount`, `product_id`) and lines tagged by `category` =
++// shipping | tax | fee | discount. They become PayPal items + amount breakdown ONLY when they reconcile to the
++// cent with the amount charged (value = item_total + shipping + tax_total + handling - discount; the remainder
++// of the floor division goes to `handling`, 0 <= remainder <= sum of quantities); otherwise the upstream single
++// item is kept and a warning is logged. Nothing is ever blocked (spec plan 32 D7 / R6). The recipient phone
++// (`shipping.phone_number`: country code + national number, both required by PayPal) and the second address
++// line travel with the same patch (N1 / R7). New code and its tests live here, next to `PurchaseUnitRequest`,
++// so every mergesk patch keeps applying and reverse-applying on its own.
++const ITEM_NAME_MAX_CHARS: usize = 127;
++const ITEM_QUANTITY_MAX: u16 = 9999;
++const LINE_TAGS: [&str; 4] = ["shipping", "tax", "fee", "discount"];
++
++/// PayPal `purchase_units[].shipping`: upstream's address + name (`ShippingAddress`, flattened) plus the
++/// recipient phone - a wrapper, so the structs and tests of the earlier patches stay untouched.
++#[derive(Default, Debug, Serialize, Eq, PartialEq)]
++pub struct ShippingDetails {
++    #[serde(flatten)]
++    shipping: ShippingAddress,
++    #[serde(skip_serializing_if = "Option::is_none")]
++    phone_number: Option<PaypalPhoneNumber>,
++}
++
++#[derive(Debug, Serialize, Eq, PartialEq)]
++pub struct PaypalPhoneNumber {
++    country_code: String,
++    national_number: Secret<String>,
++}
++
++/// Recipient phone for PayPal: `country_code` = the 1-3 digits of `PhoneDetails.country_code` ("+1" -> "1"),
++/// `national_number` = the digits of the number (a number carrying its own "+<cc>" prefix loses that prefix),
++/// 1-14 digits. A missing or malformed part -> no phone at all (PayPal requires both fields).
++fn shipping_phone(
++    shipping: Option<&hyperswitch_domain_models::address::Address>,
++) -> Option<PaypalPhoneNumber> {
++    let phone = shipping?.phone.as_ref()?;
++    let country_code = phone
++        .country_code
++        .as_deref()?
++        .chars()
++        .filter(char::is_ascii_digit)
++        .collect::<String>();
++    if country_code.is_empty() || country_code.len() > 3 {
++        return None;
++    }
++    let raw = phone.number.as_ref()?.clone().expose();
++    let digits = raw.chars().filter(char::is_ascii_digit).collect::<String>();
++    let national = if raw.trim_start().starts_with('+')
++        && digits.len() > country_code.len()
++        && digits.starts_with(&country_code)
++    {
++        digits[country_code.len()..].to_string()
++    } else {
++        digits
++    };
++    if national.is_empty() || national.len() > 14 {
++        return None;
++    }
++    Some(PaypalPhoneNumber {
++        country_code,
++        national_number: Secret::new(national),
++    })
++}
++
++/// Second address line: trimmed, cut at PayPal's 300 characters, left out when blank (same rule as the state).
++fn address_line_2_of(line2: Option<&Secret<String>>) -> Option<Secret<String>> {
++    address_state(line2)
++}
++
++fn paypal_money(
++    minor: MinorUnit,
++    currency: storage_enums::Currency,
++) -> Result<OrderAmount, error_stack::Report<errors::ConnectorError>> {
++    Ok(OrderAmount {
++        currency_code: currency,
++        value: utils::convert_amount(&StringMajorUnitForConnector, minor, currency)?,
++    })
++}
++
++fn paypal_money_if_positive(
++    minor: MinorUnit,
++    currency: storage_enums::Currency,
++) -> Result<Option<OrderAmount>, error_stack::Report<errors::ConnectorError>> {
++    if minor.get_amount_as_i64() > 0 {
++        paypal_money(minor, currency).map(Some)
++    } else {
++        Ok(None)
++    }
++}
++
++struct LineSplit {
++    items: Vec<(String, u16, MinorUnit)>,
++    item_total: MinorUnit,
++    shipping: MinorUnit,
++    tax: MinorUnit,
++    handling: MinorUnit,
++    discount: MinorUnit,
++}
++
++/// `None` = the lines do not reconcile with `total` (or there is no product line): keep the upstream single item.
++fn split_order_details(total: MinorUnit, lines: &[OrderDetailsWithAmount]) -> Option<LineSplit> {
++    let mut items: Vec<(String, u16, MinorUnit)> = Vec::new();
++    let (mut shipping, mut tax, mut fees, mut discount) = (
++        MinorUnit::zero(),
++        MinorUnit::zero(),
++        MinorUnit::zero(),
++        MinorUnit::zero(),
++    );
++    let mut quantity_sum: i64 = 0;
++    for line in lines {
++        let tagged = line.total_amount.unwrap_or(line.amount);
++        match line
++            .category
++            .as_deref()
++            .filter(|category| LINE_TAGS.contains(category))
++        {
++            Some("shipping") => shipping = shipping + tagged,
++            Some("tax") => tax = tax + tagged,
++            Some("fee") => fees = fees + tagged,
++            Some("discount") => discount = discount + tagged,
++            _ => {
++                if line.quantity == 0 || line.amount.get_amount_as_i64() == 0 {
++                    continue; // a free line changes no sum; PayPal gives no promise for unit_amount 0.00
++                }
++                if line.quantity > ITEM_QUANTITY_MAX || line.amount.get_amount_as_i64() < 0 {
++                    return None;
++                }
++                let name = line
++                    .product_name
++                    .trim()
++                    .chars()
++                    .take(ITEM_NAME_MAX_CHARS)
++                    .collect::<String>();
++                let name = name.trim_end();
++                let name = if name.is_empty() { "Item" } else { name };
++                items.push((name.to_string(), line.quantity, line.amount));
++                quantity_sum += i64::from(line.quantity);
++            }
++        }
++    }
++    if items.is_empty()
++        || [shipping, tax, fees, discount]
++            .iter()
++            .any(|value| value.get_amount_as_i64() < 0)
++    {
++        return None;
++    }
++    let item_total = items
++        .iter()
++        .map(|(_, quantity, unit)| *unit * *quantity)
++        .sum::<MinorUnit>();
++    let remainder = total - item_total - shipping - tax - fees + discount;
++    if remainder.get_amount_as_i64() < 0 || remainder.get_amount_as_i64() > quantity_sum {
++        return None;
++    }
++    Some(LineSplit {
++        items,
++        item_total,
++        shipping,
++        tax,
++        handling: fees + remainder,
++        discount,
++    })
++}
++
++/// `amount` + `items` of one purchase unit (the other fields stay `Default`, the caller sets them).
++/// `generic_*` are upstream's single-item values: they give the currency and the fallback item name.
++/// Fallback = upstream shape with `item_total = total - shipping_cost` in EVERY flow (upstream's redirect
++/// flow put the whole amount into `item_total`, which PayPal refuses as soon as `shipping_cost` > 0).
++fn purchase_lines(
++    generic_amount: OrderRequestAmount,
++    generic_items: Vec<ItemDetails>,
++    total: MinorUnit,
++    shipping_cost: Option<MinorUnit>,
++    order_details: Option<&[OrderDetailsWithAmount]>,
++) -> Result<PurchaseUnitRequest, error_stack::Report<errors::ConnectorError>> {
++    let currency = generic_amount.currency_code;
++    let shipping_cost = shipping_cost.unwrap_or(MinorUnit::zero());
++    if let Some(split) =
++        order_details.and_then(|lines| split_order_details(total - shipping_cost, lines))
++    {
++        let items = split
++            .items
++            .iter()
++            .map(|(name, quantity, unit)| {
++                Ok(ItemDetails {
++                    name: name.clone(),
++                    quantity: *quantity,
++                    unit_amount: paypal_money(*unit, currency)?,
++                    tax: None,
++                })
++            })
++            .collect::<Result<Vec<_>, error_stack::Report<errors::ConnectorError>>>()?;
++        return Ok(PurchaseUnitRequest {
++            amount: OrderRequestAmount {
++                currency_code: currency,
++                value: utils::convert_amount(&StringMajorUnitForConnector, total, currency)?,
++                breakdown: AmountBreakdown {
++                    item_total: paypal_money(split.item_total, currency)?,
++                    tax_total: paypal_money_if_positive(split.tax, currency)?,
++                    shipping: Some(paypal_money(split.shipping + shipping_cost, currency)?),
++                    handling: paypal_money_if_positive(split.handling, currency)?,
++                    discount: paypal_money_if_positive(split.discount, currency)?,
++                },
++            },
++            items,
++            ..Default::default()
++        });
++    }
++    if order_details.is_some_and(|lines| !lines.is_empty()) {
++        router_env::logger::warn!(
++            "paypal: order_details do not reconcile with the amount, sending the generic single item"
++        );
++    }
++    let item_total = total - shipping_cost;
++    let name = generic_items
++        .into_iter()
++        .next()
++        .map(|item| item.name)
++        .unwrap_or_else(|| "Item".to_string());
++    Ok(PurchaseUnitRequest {
++        amount: OrderRequestAmount {
++            currency_code: currency,
++            value: utils::convert_amount(&StringMajorUnitForConnector, total, currency)?,
++            breakdown: AmountBreakdown {
++                item_total: paypal_money(item_total, currency)?,
++                tax_total: None,
++                shipping: Some(paypal_money(shipping_cost, currency)?),
++                handling: None,
++                discount: None,
++            },
++        },
++        items: vec![ItemDetails {
++            name,
++            quantity: ORDER_QUANTITY,
++            unit_amount: paypal_money(item_total, currency)?,
++            tax: None,
++        }],
++        ..Default::default()
++    })
++}
++
++#[cfg(test)]
++mod line_items_tests {
++    use super::*;
++
++    fn usd(minor: i64) -> OrderAmount {
++        paypal_money(MinorUnit::new(minor), storage_enums::Currency::USD).expect("money")
++    }
++
++    fn generic(total: i64) -> (OrderRequestAmount, Vec<ItemDetails>) {
++        let amount = OrderRequestAmount {
++            currency_code: storage_enums::Currency::USD,
++            value: usd(total).value,
++            breakdown: AmountBreakdown {
++                item_total: usd(total),
++                tax_total: None,
++                shipping: Some(usd(0)),
++                handling: None,
++                discount: None,
++            },
++        };
++        let items = vec![ItemDetails {
++            name: "Payment for invoice pay_x_1".to_string(),
++            quantity: ORDER_QUANTITY,
++            unit_amount: usd(total),
++            tax: None,
++        }];
++        (amount, items)
++    }
++
++    // diesel_models::types::OrderDetailsWithAmount (re-exported by hyperswitch_domain_models::types) has no Default: every field spelled out
++    fn line(name: &str, quantity: u16, unit: i64, total: Option<i64>, category: Option<&str>) -> OrderDetailsWithAmount {
++        OrderDetailsWithAmount {
++            product_name: name.to_string(),
++            quantity,
++            amount: MinorUnit::new(unit),
++            requires_shipping: None,
++            product_img_link: None,
++            product_id: None,
++            category: category.map(str::to_string),
++            sub_category: None,
++            brand: None,
++            product_type: None,
++            product_tax_code: None,
++            tax_rate: None,
++            total_tax_amount: None,
++            description: None,
++            sku: None,
++            upc: None,
++            commodity_code: None,
++            unit_of_measure: None,
++            total_amount: total.map(MinorUnit::new),
++            unit_discount_amount: None,
++        }
++    }
++
++    fn build(total: i64, shipping_cost: Option<i64>, lines: Option<Vec<OrderDetailsWithAmount>>) -> serde_json::Value {
++        let (amount, items) = generic(total);
++        let unit = purchase_lines(amount, items, MinorUnit::new(total), shipping_cost.map(MinorUnit::new), lines.as_deref()).expect("purchase unit");
++        serde_json::to_value(unit).expect("json")
++    }
++
++    fn full_cart() -> Vec<OrderDetailsWithAmount> {
++        vec![
++            line("T-shirt", 1, 2990, Some(2990), None),
++            line("Hoodie", 1, 4990, Some(4990), None),
++            line("Shipping", 1, 500, Some(500), Some("shipping")),
++            line("Tax", 1, 680, Some(680), Some("tax")),
++            line("Gift wrap", 1, 200, Some(200), Some("fee")),
++        ]
++    }
++
++    #[test]
++    fn reconciled_lines_become_items_and_breakdown() {
++        let v = build(9360, None, Some(full_cart()));
++        assert_eq!(v["amount"]["value"], "93.60");
++        let b = &v["amount"]["breakdown"];
++        assert_eq!(b["item_total"]["value"], "79.80");
++        assert_eq!(b["shipping"]["value"], "5.00");
++        assert_eq!(b["tax_total"]["value"], "6.80");
++        assert_eq!(b["handling"]["value"], "2.00", "fees go to handling");
++        assert!(b.get("discount").is_none(), "{b}");
++        let items = v["items"].as_array().expect("items");
++        assert_eq!(items.len(), 2);
++        assert_eq!(items[0]["name"], "T-shirt");
++        assert_eq!(items[0]["quantity"], 1);
++        assert_eq!(items[0]["unit_amount"]["value"], "29.90");
++        assert_eq!(items[1]["name"], "Hoodie");
++        assert_eq!(items[1]["unit_amount"]["value"], "49.90");
++        assert_eq!(items[1]["unit_amount"]["currency_code"], "USD");
++    }
++
++    #[test]
++    fn floor_remainder_goes_to_handling() {
++        let v = build(2599, None, Some(vec![line("Tee", 3, 866, Some(2599), None)]));
++        assert_eq!(v["items"][0]["quantity"], 3);
++        assert_eq!(v["items"][0]["unit_amount"]["value"], "8.66");
++        assert_eq!(v["amount"]["breakdown"]["item_total"]["value"], "25.98");
++        assert_eq!(v["amount"]["breakdown"]["handling"]["value"], "0.01");
++        assert_eq!(v["amount"]["value"], "25.99");
++        let v = build(8135, None, Some(vec![line("Tee", 4, 2033, Some(8135), None)]));
++        assert_eq!(v["amount"]["breakdown"]["handling"]["value"], "0.03");
++        assert_eq!(v["amount"]["breakdown"]["item_total"]["value"], "81.32");
++    }
++
++    #[test]
++    fn lines_that_do_not_reconcile_fall_back_to_the_generic_item() {
++        let generic_shape = |v: &serde_json::Value, total: &str| {
++            assert_eq!(v["items"][0]["name"], "Payment for invoice pay_x_1", "{v}");
++            assert_eq!(v["items"].as_array().map(Vec::len), Some(1));
++            assert_eq!(v["items"][0]["unit_amount"]["value"], total);
++            assert_eq!(v["amount"]["breakdown"]["item_total"]["value"], total);
++            assert_eq!(v["amount"]["breakdown"]["shipping"]["value"], "0.00");
++            assert!(v["amount"]["breakdown"].get("handling").is_none());
++        };
++        generic_shape(&build(2700, None, Some(vec![line("Tee", 3, 866, Some(2700), None)])), "27.00"); // remainder 1.02 > 3 cents
++        generic_shape(&build(8135, None, Some(vec![line("Tee", 4, 2034, Some(8135), None)])), "81.35"); // rounded-up unit price: negative remainder
++        generic_shape(&build(2990, None, Some(vec![line("Tee", 1, 2990, None, None), line("Ship", 1, 9000, None, Some("shipping"))])), "29.90");
++        generic_shape(&build(2990, None, Some(vec![line("Tee", 1, -2990, Some(-2990), None), line("Fee", 1, 5980, None, Some("fee"))])), "29.90");
++    }
++
++    #[test]
++    fn no_or_empty_order_details_keep_the_upstream_shape() {
++        for lines in [None, Some(vec![])] {
++            let v = build(3490, None, lines);
++            assert_eq!(v["items"][0]["name"], "Payment for invoice pay_x_1");
++            assert_eq!(v["items"][0]["quantity"], 1);
++            assert_eq!(v["items"][0]["unit_amount"]["value"], "34.90");
++            assert_eq!(v["amount"]["value"], "34.90");
++            assert_eq!(v["amount"]["breakdown"]["item_total"]["value"], "34.90");
++            assert_eq!(v["amount"]["breakdown"]["shipping"]["value"], "0.00");
++            assert!(v["amount"]["breakdown"]["tax_total"].is_null(), "tax_total stays null as upstream");
++            assert!(v["amount"]["breakdown"].get("handling").is_none());
++            assert!(v["amount"]["breakdown"].get("discount").is_none());
++        }
++    }
++
++    #[test]
++    fn generic_item_total_excludes_router_shipping_cost_in_every_flow() {
++        let v = build(3490, Some(500), None);
++        assert_eq!(v["amount"]["value"], "34.90");
++        assert_eq!(v["amount"]["breakdown"]["item_total"]["value"], "29.90");
++        assert_eq!(v["amount"]["breakdown"]["shipping"]["value"], "5.00");
++        assert_eq!(v["items"][0]["unit_amount"]["value"], "29.90");
++        let v = build(3490, Some(500), Some(vec![line("Tee", 1, 2990, Some(2990), None)]));
++        assert_eq!(v["items"][0]["name"], "Tee", "lines reconcile with total - shipping_cost");
++        assert_eq!(v["amount"]["breakdown"]["shipping"]["value"], "5.00");
++        assert_eq!(v["amount"]["breakdown"]["item_total"]["value"], "29.90");
++    }
++
++    #[test]
++    fn negative_fee_is_a_discount() {
++        let v = build(2690, None, Some(vec![line("Tee", 1, 2990, Some(2990), None), line("Loyalty", 1, 300, Some(300), Some("discount"))]));
++        assert_eq!(v["amount"]["value"], "26.90");
++        assert_eq!(v["amount"]["breakdown"]["item_total"]["value"], "29.90");
++        assert_eq!(v["amount"]["breakdown"]["discount"]["value"], "3.00");
++        assert!(v["amount"]["breakdown"].get("handling").is_none());
++        assert_eq!(v["items"].as_array().map(Vec::len), Some(1));
++    }
++
++    #[test]
++    fn zero_lines_are_dropped_and_only_zero_lines_fall_back() {
++        let v = build(2990, None, Some(vec![line("Free sticker", 1, 0, Some(0), None), line("Tee", 1, 2990, Some(2990), None)]));
++        assert_eq!(v["items"].as_array().map(Vec::len), Some(1));
++        assert_eq!(v["items"][0]["name"], "Tee");
++        let v = build(500, None, Some(vec![line("Free", 1, 0, Some(0), None), line("Shipping", 1, 500, Some(500), Some("shipping"))]));
++        assert_eq!(v["items"][0]["name"], "Payment for invoice pay_x_1", "no product line -> generic");
++    }
++
++    #[test]
++    fn names_are_cut_quantity_is_bounded_unknown_category_is_a_product() {
++        let v = build(100, None, Some(vec![line(&"n".repeat(200), 1, 100, Some(100), None)]));
++        assert_eq!(v["items"][0]["name"].as_str().map(|s| s.chars().count()), Some(127));
++        let v = build(100, None, Some(vec![line("   ", 1, 100, Some(100), None)]));
++        assert_eq!(v["items"][0]["name"], "Item");
++        let v = build(10000, None, Some(vec![line("Pin", 10000, 1, Some(10000), None)]));
++        assert_eq!(v["items"][0]["name"], "Payment for invoice pay_x_1", "quantity above the bound -> generic");
++        let v = build(100, None, Some(vec![line("Odd", 1, 100, Some(100), Some("weird"))]));
++        assert_eq!(v["items"][0]["name"], "Odd");
++        let v = build(3490, None, Some(vec![line("Tee", 1, 2990, None, None), line("Shipping", 1, 500, None, Some("shipping"))]));
++        assert_eq!(v["amount"]["breakdown"]["shipping"]["value"], "5.00", "tagged line without total_amount uses amount");
++        assert_eq!(v["items"][0]["name"], "Tee");
++    }
++
++    #[test]
++    fn breakdown_serializes_with_paypal_field_names() {
++        let v = build(9360, None, Some(full_cart()));
++        let mut keys = v["amount"]["breakdown"].as_object().expect("breakdown").keys().cloned().collect::<Vec<_>>();
++        keys.sort();
++        assert_eq!(keys, vec!["handling", "item_total", "shipping", "tax_total"]);
++        assert_eq!(v["amount"]["currency_code"], "USD");
++        let mut unit_keys = v.as_object().expect("unit").keys().cloned().collect::<Vec<_>>();
++        unit_keys.sort();
++        assert_eq!(unit_keys, vec!["amount", "custom_id", "invoice_id", "items", "reference_id", "shipping"]);
++    }
++}
++
++#[cfg(test)]
++mod shipping_contact_tests {
++    use hyperswitch_domain_models::address::{Address as DomainAddress, AddressDetails, PhoneDetails};
++
++    use super::*;
++
++    fn secret(value: &str) -> Option<Secret<String>> {
++        Some(Secret::new(value.to_string()))
++    }
++
++    fn domain(line2: Option<&str>, phone: Option<(&str, Option<&str>)>) -> DomainAddress {
++        DomainAddress {
++            address: Some(AddressDetails {
++                city: Some("Austin".to_string()),
++                country: Some(enums::CountryAlpha2::US),
++                line1: secret("9 Oak Ave"),
++                line2: line2.and_then(secret),
++                zip: secret("78701"),
++                first_name: secret("Bob"),
++                last_name: secret("Recipient"),
++                ..Default::default()
++            }),
++            phone: phone.map(|(number, country_code)| PhoneDetails {
++                number: secret(number),
++                country_code: country_code.map(str::to_string),
++            }),
++            ..Default::default()
++        }
++    }
++
++    #[test]
++    fn line2_is_sent_trimmed_and_left_out_when_blank() {
++        let line2_of = |value: Option<&str>| {
++            get_address_info(Some(&domain(value, None)))
++                .expect("address")
++                .address_line_2
++                .map(|line2| line2.expose())
++        };
++        assert_eq!(line2_of(Some(" Apt 5 ")), Some("Apt 5".to_string()));
++        for blank in [None, Some(""), Some("  ")] {
++            assert_eq!(line2_of(blank), None, "line2 {blank:?}");
++        }
++        assert_eq!(line2_of(Some(&"x".repeat(400))).map(|line2| line2.chars().count()), Some(300));
++        let json = serde_json::to_value(get_address_info(Some(&domain(None, None))).expect("address")).expect("json");
++        assert!(json.get("address_line_2").is_none(), "blank line2 must not be serialized: {json}");
++        let json = serde_json::to_value(get_address_info(Some(&domain(Some("Apt 5"), None))).expect("address")).expect("json");
++        assert_eq!(json["address_line_2"], "Apt 5");
++        assert_eq!(json["address_line_1"], "9 Oak Ave");
++        assert_eq!(json["admin_area_2"], "Austin");
++    }
++
++    #[test]
++    fn phone_needs_country_code_and_digits() {
++        let phone_of = |number: &str, country_code: Option<&str>| {
++            shipping_phone(Some(&domain(None, Some((number, country_code)))))
++                .map(|phone| (phone.country_code, phone.national_number.expose()))
++        };
++        assert_eq!(phone_of("(214) 555-0100", Some("1")), Some(("1".to_string(), "2145550100".to_string())));
++        assert_eq!(phone_of("0911 222 333", Some("+84")), Some(("84".to_string(), "0911222333".to_string())));
++        assert_eq!(phone_of("+1 408 555 1234", Some("1")), Some(("1".to_string(), "4085551234".to_string())), "own +cc prefix removed");
++        assert_eq!(phone_of("+44 20 7946 0958", Some("44")), Some(("44".to_string(), "2079460958".to_string())));
++        assert_eq!(phone_of("1408 555 1234", Some("1")), Some(("1".to_string(), "14085551234".to_string())), "no + sign: digits kept");
++        assert_eq!(phone_of("2145550100", None), None, "no country code -> no phone");
++        assert_eq!(phone_of("2145550100", Some("")), None);
++        assert_eq!(phone_of("2145550100", Some("1234")), None);
++        assert_eq!(phone_of("", Some("1")), None);
++        assert_eq!(phone_of("abc", Some("1")), None);
++        assert_eq!(phone_of(&"9".repeat(15), Some("1")), None, "more than 14 digits");
++        assert_eq!(phone_of(&"9".repeat(14), Some("1")).map(|phone| phone.1.len()), Some(14));
++        assert!(shipping_phone(None).is_none());
++        assert!(shipping_phone(Some(&DomainAddress::default())).is_none());
++    }
++
++    #[test]
++    fn serialized_shipping_details_carry_phone_and_line2() {
++        let d = domain(Some("Apt 5"), Some(("2145550100", Some("1"))));
++        let details = ShippingDetails {
++            shipping: ShippingAddress {
++                address: get_address_info(Some(&d)),
++                name: Some(ShippingName {
++                    full_name: shipping_full_name(Some(&d)),
++                }),
++            },
++            phone_number: shipping_phone(Some(&d)),
++        };
++        let json = serde_json::to_value(&details).expect("json");
++        assert_eq!(json["address"]["address_line_2"], "Apt 5");
++        assert_eq!(json["address"]["admin_area_2"], "Austin");
++        assert_eq!(json["name"]["full_name"], "Bob Recipient");
++        assert_eq!(json["phone_number"]["country_code"], "1");
++        assert_eq!(json["phone_number"]["national_number"], "2145550100");
++        let no_phone = ShippingDetails {
++            shipping: ShippingAddress {
++                address: get_address_info(Some(&domain(None, None))),
++                name: None,
++            },
++            phone_number: None,
++        };
++        let json = serde_json::to_value(&no_phone).expect("json");
++        assert!(json.get("phone_number").is_none(), "{json}");
++        assert!(json["address"].get("address_line_2").is_none());
++        assert!(json["name"].is_null());
++    }
++}
++// ---- end mergesk patch paypal-line-items ---------------------------------------------------------
++
+ #[derive(Default, Debug, Deserialize, Serialize, Eq, PartialEq)]
+ pub struct Payee {
+     merchant_id: Secret<String>,
+@@ -367,6 +930,9 @@ impl TryFrom<&PaypalRouterData<&SdkSessionUpdateRouterData>> for ItemDetails {
+ #[derive(Default, Debug, Serialize, Eq, PartialEq, Deserialize)]
+ pub struct Address {
+     address_line_1: Option<Secret<String>>,
++    // mergesk patch paypal-line-items (plan 32 N1): second address line, trimmed, cut at 300, left out when blank
++    #[serde(skip_serializing_if = "Option::is_none")]
++    address_line_2: Option<Secret<String>>,
+     postal_code: Option<Secret<String>>,
+     country_code: enums::CountryAlpha2,
+     admin_area_2: Option<String>,
+@@ -1083,6 +1649,7 @@ fn get_address_info(
+     match address {
+         Some(address) => address.get_optional_country().map(|country| Address {
+             country_code: country.to_owned(),
++            address_line_2: address_line_2_of(address.line2.as_ref()),
+             address_line_1: address.line1.clone(),
+             postal_code: address.zip.clone(),
+             admin_area_2: address.city.clone(),
+@@ -1333,10 +1900,19 @@ impl TryFrom<&PaypalRouterData<&PaymentsPostSessionTokensRouterData>> for Paypal
+             reference_id: Some(connector_request_reference_id.clone()),
+             custom_id: item.router_data.request.merchant_order_reference_id.clone(),
+             invoice_id: Some(connector_request_reference_id),
+-            amount,
+             payee,
+-            shipping: Some(shipping_address),
+-            items: item_details,
++            // mergesk patch paypal-line-items (plan 32): recipient phone; real items + breakdown when the order lines reconcile
++            shipping: Some(ShippingDetails {
++                phone_number: shipping_phone(item.router_data.get_optional_shipping()),
++                shipping: shipping_address,
++            }),
++            ..purchase_lines(
++                amount,
++                item_details,
++                item.router_data.request.amount,
++                item.router_data.request.shipping_cost,
++                item.router_data.request.order_details.as_deref(),
++            )?
+         }];
+         let payment_source = Some(PaymentSourceItem::Paypal(
+             PaypalRedirectionRequest::PaypalRedirectionStruct(PaypalRedirectionStruct {
+@@ -1450,10 +2026,19 @@ impl TryFrom<&PaypalRouterData<&PaymentsAuthorizeRouterData>> for PaypalPayments
+             reference_id: Some(connector_request_reference_id.clone()),
+             custom_id: item.router_data.request.merchant_order_reference_id.clone(),
+             invoice_id: Some(connector_request_reference_id),
+-            amount,
+             payee,
+-            shipping: Some(shipping_address),
+-            items: item_details,
++            // mergesk patch paypal-line-items (plan 32): recipient phone; real items + breakdown when the order lines reconcile
++            shipping: Some(ShippingDetails {
++                phone_number: shipping_phone(item.router_data.get_optional_shipping()),
++                shipping: shipping_address,
++            }),
++            ..purchase_lines(
++                amount,
++                item_details,
++                item.router_data.request.minor_amount,
++                item.router_data.request.shipping_cost,
++                item.router_data.request.order_details.as_deref(),
++            )?
+         }];
+ 
+         match item.router_data.request.payment_method_data {
+diff --git a/crates/hyperswitch_domain_models/src/router_request_types.rs b/crates/hyperswitch_domain_models/src/router_request_types.rs
+--- a/crates/hyperswitch_domain_models/src/router_request_types.rs
++++ b/crates/hyperswitch_domain_models/src/router_request_types.rs
+@@ -284,6 +284,8 @@ pub struct PaymentsPostSessionTokensData {
+     pub shipping_cost: Option<MinorUnit>,
+     pub setup_future_usage: Option<storage_enums::FutureUsage>,
+     pub router_return_url: Option<String>,
++    // mergesk patch paypal-line-items (plan 32): order lines of the intent, so the PayPal JS SDK order (PostSessionTokens) can carry real items
++    pub order_details: Option<Vec<OrderDetailsWithAmount>>,
+ }
+ 
+ #[derive(Debug, Clone, Serialize)]
+diff --git a/crates/router/src/core/payments/transformers.rs b/crates/router/src/core/payments/transformers.rs
+--- a/crates/router/src/core/payments/transformers.rs
++++ b/crates/router/src/core/payments/transformers.rs
+@@ -6104,6 +6104,25 @@ impl<F: Clone> TryFrom<PaymentAdditionalData<'_, F>> for types::PaymentsPostSess
+             connector_name,
+             payment_data.creds_identifier.as_deref(),
+         ));
++        // mergesk patch paypal-line-items (plan 32): same parsing as for PaymentsAuthorizeData
++        let order_details = payment_data
++            .payment_intent
++            .order_details
++            .as_ref()
++            .map(|order_details| {
++                order_details
++                    .iter()
++                    .map(|data| {
++                        data.to_owned()
++                            .parse_value("OrderDetailsWithAmount")
++                            .change_context(errors::ApiErrorResponse::InvalidDataValue {
++                                field_name: "OrderDetailsWithAmount",
++                            })
++                            .attach_printable("Unable to parse OrderDetailsWithAmount")
++                    })
++                    .collect::<Result<Vec<_>, _>>()
++            })
++            .transpose()?;
+         Ok(Self {
+             amount, //need to change after we move to connector module
+             order_amount: payment_data.payment_intent.amount,
+@@ -6116,6 +6135,7 @@ impl<F: Clone> TryFrom<PaymentAdditionalData<'_, F>> for types::PaymentsPostSess
+                 .setup_future_usage_applied
+                 .or(payment_data.payment_intent.setup_future_usage),
+             router_return_url,
++            order_details,
+         })
+     }
+ }
