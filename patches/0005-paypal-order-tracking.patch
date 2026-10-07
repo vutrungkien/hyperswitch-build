@@ -1,0 +1,1853 @@
+diff --git a/crates/api_models/src/events/payment.rs b/crates/api_models/src/events/payment.rs
+index a1c33bd..a245ff0 100644
+--- a/crates/api_models/src/events/payment.rs
++++ b/crates/api_models/src/events/payment.rs
+@@ -42,8 +42,8 @@ use crate::{
+         PaymentsManualStatusUpdateRequest, PaymentsManualStatusUpdateResponse,
+         PaymentsManualUpdateRequest, PaymentsManualUpdateResponse,
+         PaymentsPostSessionTokensRequest, PaymentsPostSessionTokensResponse, PaymentsRejectRequest,
+-        PaymentsRetrieveRequest, PaymentsStartRequest, PaymentsUpdateMetadataRequest,
+-        PaymentsUpdateMetadataResponse,
++        PaymentsRetrieveRequest, PaymentsStartRequest, PaymentsTrackRequest, PaymentsTrackResponse,
++        PaymentsUpdateMetadataRequest, PaymentsUpdateMetadataResponse,
+     },
+ };
+ 
+@@ -122,6 +122,25 @@ impl ApiEventMetric for PaymentsUpdateMetadataResponse {
+     }
+ }
+ 
++// mergesk patch 0005
++#[cfg(feature = "v1")]
++impl ApiEventMetric for PaymentsTrackRequest {
++    fn get_api_event_type(&self) -> Option<ApiEventsType> {
++        Some(ApiEventsType::Payment {
++            payment_id: self.payment_id.clone(),
++        })
++    }
++}
++
++#[cfg(feature = "v1")]
++impl ApiEventMetric for PaymentsTrackResponse {
++    fn get_api_event_type(&self) -> Option<ApiEventsType> {
++        Some(ApiEventsType::Payment {
++            payment_id: self.payment_id.clone(),
++        })
++    }
++}
++
+ #[cfg(feature = "v1")]
+ impl ApiEventMetric for PaymentsPostSessionTokensResponse {
+     fn get_api_event_type(&self) -> Option<ApiEventsType> {
+diff --git a/crates/api_models/src/payments.rs b/crates/api_models/src/payments.rs
+index 3b5e735..7634b89 100644
+--- a/crates/api_models/src/payments.rs
++++ b/crates/api_models/src/payments.rs
+@@ -9709,6 +9709,63 @@ pub struct PaymentsUpdateMetadataResponse {
+     pub feature_metadata: Option<FeatureMetadata>,
+ }
+ 
++/// mergesk patch 0005 (plan 33): shipment tracking of a captured payment, sent to its connector
++/// (PayPal `POST /v2/checkout/orders/{id}/track`). Body of `POST /payments/{payment_id}/track`.
++#[derive(Debug, serde::Deserialize, serde::Serialize, Clone, ToSchema)]
++#[serde(deny_unknown_fields)]
++pub struct PaymentsTrackRequest {
++    /// The unique identifier for the payment
++    #[serde(skip_deserializing)]
++    #[schema(value_type = String)]
++    pub payment_id: id_type::PaymentId,
++    /// Tracking number of the shipment (1 to 64 characters)
++    pub tracking_number: String,
++    /// Carrier code as the connector expects it (PayPal carrier enum such as `USPS`, or `OTHER`)
++    pub carrier: String,
++    /// Carrier name, required when `carrier` is `OTHER`
++    pub carrier_name_other: Option<String>,
++    /// Whether the connector notifies the payer (default false)
++    pub notify_payer: Option<bool>,
++    /// Items in the shipment
++    pub items: Option<Vec<PaymentsTrackItem>>,
++}
++
++/// mergesk patch 0005: one item of a tracked shipment
++#[derive(Debug, serde::Deserialize, serde::Serialize, Clone, ToSchema)]
++#[serde(deny_unknown_fields)]
++pub struct PaymentsTrackItem {
++    /// Item name
++    pub name: String,
++    /// Quantity as a string (PayPal item quantity)
++    pub quantity: String,
++}
++
++/// mergesk patch 0005: outcome of a tracking request at the connector
++#[derive(Debug, serde::Serialize, Clone, Copy, PartialEq, Eq, ToSchema)]
++#[serde(rename_all = "snake_case")]
++pub enum PaymentsTrackStatus {
++    /// The connector accepted the tracker
++    Sent,
++    /// The connector refused the tracker; see `error_code` / `error_message`
++    Failed,
++}
++
++/// mergesk patch 0005: response of `POST /payments/{payment_id}/track`
++#[derive(Debug, serde::Serialize, Clone, ToSchema)]
++pub struct PaymentsTrackResponse {
++    /// The identifier for the payment
++    #[schema(value_type = String)]
++    pub payment_id: id_type::PaymentId,
++    /// `sent` or `failed`
++    pub status: PaymentsTrackStatus,
++    /// Tracker id at the connector (PayPal: `{capture_id}-{tracking_number}`) when sent
++    pub tracker_id: Option<String>,
++    /// Connector error code when failed
++    pub error_code: Option<String>,
++    /// Connector error message when failed
++    pub error_message: Option<String>,
++}
++
+ #[derive(Debug, serde::Deserialize, serde::Serialize, Clone, ToSchema)]
+ pub struct PaymentsPostSessionTokensRequest {
+     /// The unique identifier for the payment
+diff --git a/crates/hyperswitch_connectors/src/connectors/dummyconnector.rs b/crates/hyperswitch_connectors/src/connectors/dummyconnector.rs
+index 18224a2..6d397dd 100644
+--- a/crates/hyperswitch_connectors/src/connectors/dummyconnector.rs
++++ b/crates/hyperswitch_connectors/src/connectors/dummyconnector.rs
+@@ -14,32 +14,32 @@ use hyperswitch_domain_models::{
+     router_data::{AccessToken, ConnectorAuthType, ErrorResponse, RouterData},
+     router_flow_types::{
+         AccessTokenAuth, Authorize, Capture, Execute, PSync, PaymentMethodToken, RSync, Session,
+-        SetupMandate, Void,
++        SetupMandate, Track, Void,
+     },
+     router_request_types::{
+         AccessTokenRequestData, PaymentMethodTokenizationData, PaymentsAuthorizeData,
+         PaymentsCancelData, PaymentsCaptureData, PaymentsSessionData, PaymentsSyncData,
+-        RefundsData, SetupMandateRequestData,
++        PaymentsTrackData, RefundsData, SetupMandateRequestData,
+     },
+-    router_response_types::{PaymentsResponseData, RefundsResponseData},
++    router_response_types::{PaymentsResponseData, PaymentsTrackResponseData, RefundsResponseData},
+     types::{
+         PaymentsAuthorizeRouterData, PaymentsCaptureRouterData, PaymentsSyncRouterData,
+-        RefundSyncRouterData, RefundsRouterData,
++        PaymentsTrackRouterData, RefundSyncRouterData, RefundsRouterData,
+     },
+ };
+ use hyperswitch_interfaces::{
+     api::{
+         ConnectorAccessToken, ConnectorCommon, ConnectorCommonExt, ConnectorIntegration,
+         ConnectorSpecifications, ConnectorValidation, MandateSetup, Payment, PaymentAuthorize,
+-        PaymentCapture, PaymentSession, PaymentSync, PaymentToken, PaymentVoid, Refund,
+-        RefundExecute, RefundSync,
++        PaymentCapture, PaymentSession, PaymentSync, PaymentToken, PaymentTrack, PaymentVoid,
++        Refund, RefundExecute, RefundSync,
+     },
+     configs::Connectors,
+     errors::ConnectorError,
+     events::connector_api_logs::ConnectorEvent,
+     types::{
+-        PaymentsAuthorizeType, PaymentsCaptureType, PaymentsSyncType, RefundExecuteType,
+-        RefundSyncType, Response,
++        PaymentsAuthorizeType, PaymentsCaptureType, PaymentsSyncType, PaymentsTrackType,
++        RefundExecuteType, RefundSyncType, Response,
+     },
+     webhooks::{IncomingWebhook, IncomingWebhookRequestDetails, WebhookContext},
+ };
+@@ -73,6 +73,7 @@ impl<const T: u8> PaymentAuthorize for DummyConnector<T> {}
+ impl<const T: u8> PaymentSync for DummyConnector<T> {}
+ impl<const T: u8> PaymentCapture for DummyConnector<T> {}
+ impl<const T: u8> PaymentVoid for DummyConnector<T> {}
++impl<const T: u8> PaymentTrack for DummyConnector<T> {}
+ impl<const T: u8> Refund for DummyConnector<T> {}
+ impl<const T: u8> RefundExecute for DummyConnector<T> {}
+ impl<const T: u8> RefundSync for DummyConnector<T> {}
+@@ -388,6 +389,79 @@ impl<const T: u8> ConnectorIntegration<PSync, PaymentsSyncData, PaymentsResponse
+     }
+ }
+ 
++/// mergesk patch 0005 (plan 33): tracking for the e2e router (L2): one real round trip (reads the dummy payment back), then
++/// answers `dummy-{tracking_number}` (dummyconnector/transformers.rs).
++impl<const T: u8> ConnectorIntegration<Track, PaymentsTrackData, PaymentsTrackResponseData>
++    for DummyConnector<T>
++{
++    fn get_headers(
++        &self,
++        req: &PaymentsTrackRouterData,
++        connectors: &Connectors,
++    ) -> CustomResult<Vec<(String, Maskable<String>)>, ConnectorError> {
++        self.build_headers(req, connectors)
++    }
++
++    fn get_content_type(&self) -> &'static str {
++        self.common_get_content_type()
++    }
++
++    fn get_url(
++        &self,
++        req: &PaymentsTrackRouterData,
++        connectors: &Connectors,
++    ) -> CustomResult<String, ConnectorError> {
++        Ok(format!(
++            "{}/payments/{}",
++            self.base_url(connectors),
++            req.request.connector_transaction_id
++        ))
++    }
++
++    fn build_request(
++        &self,
++        req: &PaymentsTrackRouterData,
++        connectors: &Connectors,
++    ) -> CustomResult<Option<Request>, ConnectorError> {
++        Ok(Some(
++            RequestBuilder::new()
++                .method(Method::Get)
++                .url(&PaymentsTrackType::get_url(self, req, connectors)?)
++                .attach_default_headers()
++                .headers(PaymentsTrackType::get_headers(self, req, connectors)?)
++                .build(),
++        ))
++    }
++
++    fn handle_response(
++        &self,
++        data: &PaymentsTrackRouterData,
++        event_builder: Option<&mut ConnectorEvent>,
++        res: Response,
++    ) -> CustomResult<PaymentsTrackRouterData, ConnectorError> {
++        let response: transformers::PaymentsResponse = res
++            .response
++            .parse_struct("dummyconnector PaymentsTrackResponse")
++            .change_context(ConnectorError::ResponseDeserializationFailed)?;
++        event_builder.map(|i| i.set_response_body(&response));
++        router_env::logger::info!(connector_response=?response);
++        RouterData::try_from(ResponseRouterData {
++            response,
++            data: data.clone(),
++            http_code: res.status_code,
++        })
++        .change_context(ConnectorError::ResponseHandlingFailed)
++    }
++
++    fn get_error_response(
++        &self,
++        res: Response,
++        event_builder: Option<&mut ConnectorEvent>,
++    ) -> CustomResult<ErrorResponse, ConnectorError> {
++        self.build_error_response(res, event_builder)
++    }
++}
++
+ impl<const T: u8> ConnectorIntegration<Capture, PaymentsCaptureData, PaymentsResponseData>
+     for DummyConnector<T>
+ {
+diff --git a/crates/hyperswitch_connectors/src/connectors/dummyconnector/transformers.rs b/crates/hyperswitch_connectors/src/connectors/dummyconnector/transformers.rs
+index 4225327..c31dcbc 100644
+--- a/crates/hyperswitch_connectors/src/connectors/dummyconnector/transformers.rs
++++ b/crates/hyperswitch_connectors/src/connectors/dummyconnector/transformers.rs
+@@ -5,10 +5,12 @@ use hyperswitch_domain_models::{
+         Card, PayLaterData, PaymentMethodData, UpiCollectData, UpiData, WalletData,
+     },
+     router_data::{ConnectorAuthType, RouterData},
+-    router_flow_types::{Execute, RSync},
+-    router_request_types::ResponseId,
+-    router_response_types::{PaymentsResponseData, RedirectForm, RefundsResponseData},
+-    types::{PaymentsAuthorizeRouterData, RefundsRouterData},
++    router_flow_types::{Execute, RSync, Track},
++    router_request_types::{PaymentsTrackData, ResponseId},
++    router_response_types::{
++        PaymentsResponseData, PaymentsTrackResponseData, RedirectForm, RefundsResponseData,
++    },
++    types::{PaymentsAuthorizeRouterData, PaymentsTrackRouterData, RefundsRouterData},
+ };
+ use hyperswitch_interfaces::errors::ConnectorError;
+ use hyperswitch_masking::Secret;
+@@ -325,6 +327,24 @@ impl<F, T> TryFrom<ResponseRouterData<F, PaymentsResponse, T, PaymentsResponseDa
+     }
+ }
+ 
++/// mergesk patch 0005 (plan 33): the dummy connector accepts every tracker once the payment reads back; id `dummy-{tracking_number}`.
++impl TryFrom<ResponseRouterData<Track, PaymentsResponse, PaymentsTrackData, PaymentsTrackResponseData>>
++    for PaymentsTrackRouterData
++{
++    type Error = error_stack::Report<ConnectorError>;
++    fn try_from(
++        item: ResponseRouterData<Track, PaymentsResponse, PaymentsTrackData, PaymentsTrackResponseData>,
++    ) -> Result<Self, Self::Error> {
++        Ok(Self {
++            response: Ok(PaymentsTrackResponseData {
++                tracker_id: format!("dummy-{}", item.data.request.tracking_number),
++                status: "SHIPPED".to_string(),
++            }),
++            ..item.data
++        })
++    }
++}
++
+ #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+ #[serde(rename_all = "snake_case")]
+ pub enum DummyConnectorNextAction {
+diff --git a/crates/hyperswitch_connectors/src/connectors/paypal.rs b/crates/hyperswitch_connectors/src/connectors/paypal.rs
+index 63e2f70..2498c88 100644
+--- a/crates/hyperswitch_connectors/src/connectors/paypal.rs
++++ b/crates/hyperswitch_connectors/src/connectors/paypal.rs
+@@ -22,7 +22,7 @@ use hyperswitch_domain_models::{
+         payments::{
+             Authorize, Capture, ExtendAuthorization, IncrementalAuthorization, PSync,
+             PaymentMethodToken, PostSessionTokens, PreProcessing, SdkSessionUpdate, Session,
+-            SetupMandate, Void,
++            SetupMandate, Track, Void,
+         },
+         refunds::{Execute, RSync},
+         unified_authentication_service::PostAuthenticate,
+@@ -33,20 +33,20 @@ use hyperswitch_domain_models::{
+         PaymentsAuthorizeData, PaymentsCancelData, PaymentsCaptureData,
+         PaymentsExtendAuthorizationData, PaymentsIncrementalAuthorizationData,
+         PaymentsPostAuthenticateData, PaymentsPostSessionTokensData, PaymentsPreProcessingData,
+-        PaymentsSessionData, PaymentsSyncData, RefundsData, SdkPaymentsSessionUpdateData,
+-        SetupMandateRequestData, VerifyWebhookSourceRequestData,
++        PaymentsSessionData, PaymentsSyncData, PaymentsTrackData, RefundsData,
++        SdkPaymentsSessionUpdateData, SetupMandateRequestData, VerifyWebhookSourceRequestData,
+     },
+     router_response_types::{
+-        ConnectorInfo, PaymentMethodDetails, PaymentsResponseData, RefundsResponseData,
+-        SupportedPaymentMethods, SupportedPaymentMethodsExt, VerifyWebhookSourceResponseData,
++        ConnectorInfo, PaymentMethodDetails, PaymentsResponseData, PaymentsTrackResponseData,
++        RefundsResponseData, SupportedPaymentMethods, SupportedPaymentMethodsExt, VerifyWebhookSourceResponseData,
+     },
+     types::{
+         PaymentsAuthorizeRouterData, PaymentsCancelRouterData, PaymentsCaptureRouterData,
+         PaymentsCompleteAuthorizeRouterData, PaymentsExtendAuthorizationRouterData,
+         PaymentsIncrementalAuthorizationRouterData, PaymentsPostAuthenticateRouterData,
+         PaymentsPostSessionTokensRouterData, PaymentsPreProcessingRouterData,
+-        PaymentsSessionRouterData, PaymentsSyncRouterData, RefreshTokenRouterData,
+-        RefundSyncRouterData, RefundsRouterData, SdkSessionUpdateRouterData,
++        PaymentsSessionRouterData, PaymentsSyncRouterData, PaymentsTrackRouterData,
++        RefreshTokenRouterData, RefundSyncRouterData, RefundsRouterData, SdkSessionUpdateRouterData,
+         SetupMandateRouterData, VerifyWebhookSourceRouterData,
+     },
+ };
+@@ -71,8 +71,8 @@ use hyperswitch_interfaces::{
+         ExtendedAuthorizationType, IncrementalAuthorizationType, PaymentsAuthorizeType,
+         PaymentsCaptureType, PaymentsCompleteAuthorizeType, PaymentsPostAuthenticateType,
+         PaymentsPostSessionTokensType, PaymentsPreProcessingType, PaymentsSessionType,
+-        PaymentsSyncType, PaymentsVoidType, RefreshTokenType, RefundExecuteType, RefundSyncType,
+-        Response, SdkSessionUpdateType, SetupMandateType, VerifyWebhookSourceType,
++        PaymentsSyncType, PaymentsTrackType, PaymentsVoidType, RefreshTokenType, RefundExecuteType,
++        RefundSyncType, Response, SdkSessionUpdateType, SetupMandateType, VerifyWebhookSourceType,
+     },
+     webhooks::{IncomingWebhook, IncomingWebhookRequestDetails, WebhookContext},
+ };
+@@ -122,6 +122,7 @@ impl api::PaymentVoid for Paypal {}
+ impl api::Refund for Paypal {}
+ impl api::RefundExecute for Paypal {}
+ impl api::RefundSync for Paypal {}
++impl api::PaymentTrack for Paypal {}
+ impl api::ConnectorVerifyWebhookSource for Paypal {}
+ impl api::PaymentPostSessionTokens for Paypal {}
+ impl api::PaymentSessionUpdate for Paypal {}
+@@ -2337,6 +2338,84 @@ impl
+     }
+ }
+ 
++/// mergesk patch 0005 (plan 33): shipment tracking `POST /v2/checkout/orders/{order_id}/track` of a captured order
++/// (order id = connector_transaction_id of the attempt, capture id from `PaypalMeta` of the same attempt).
++impl ConnectorIntegration<Track, PaymentsTrackData, PaymentsTrackResponseData> for Paypal {
++    fn get_headers(
++        &self,
++        req: &PaymentsTrackRouterData,
++        connectors: &Connectors,
++    ) -> CustomResult<Vec<(String, Maskable<String>)>, errors::ConnectorError> {
++        self.build_headers(req, connectors)
++    }
++
++    fn get_content_type(&self) -> &'static str {
++        self.common_get_content_type()
++    }
++
++    fn get_url(
++        &self,
++        req: &PaymentsTrackRouterData,
++        connectors: &Connectors,
++    ) -> CustomResult<String, errors::ConnectorError> {
++        Ok(format!(
++            "{}v2/checkout/orders/{}/track",
++            self.base_url(connectors),
++            req.request.connector_transaction_id,
++        ))
++    }
++
++    fn get_request_body(
++        &self,
++        req: &PaymentsTrackRouterData,
++        _connectors: &Connectors,
++    ) -> CustomResult<RequestContent, errors::ConnectorError> {
++        let connector_req = paypal::PaypalTrackRequest::try_from(req)?;
++        Ok(RequestContent::Json(Box::new(connector_req)))
++    }
++
++    fn build_request(
++        &self,
++        req: &PaymentsTrackRouterData,
++        connectors: &Connectors,
++    ) -> CustomResult<Option<Request>, errors::ConnectorError> {
++        let request = RequestBuilder::new()
++            .method(Method::Post)
++            .url(&PaymentsTrackType::get_url(self, req, connectors)?)
++            .headers(PaymentsTrackType::get_headers(self, req, connectors)?)
++            .set_body(PaymentsTrackType::get_request_body(self, req, connectors)?)
++            .build();
++        Ok(Some(request))
++    }
++
++    fn handle_response(
++        &self,
++        data: &PaymentsTrackRouterData,
++        event_builder: Option<&mut ConnectorEvent>,
++        res: Response,
++    ) -> CustomResult<PaymentsTrackRouterData, errors::ConnectorError> {
++        let response: paypal::PaypalTrackResponse = res
++            .response
++            .parse_struct("paypal PaypalTrackResponse")
++            .change_context(errors::ConnectorError::ResponseDeserializationFailed)?;
++        event_builder.map(|i| i.set_response_body(&response));
++        router_env::logger::info!(connector_response=?response);
++        RouterData::try_from(ResponseRouterData {
++            response,
++            data: data.clone(),
++            http_code: res.status_code,
++        })
++    }
++
++    fn get_error_response(
++        &self,
++        res: Response,
++        event_builder: Option<&mut ConnectorEvent>,
++    ) -> CustomResult<ErrorResponse, errors::ConnectorError> {
++        self.build_error_response(res, event_builder)
++    }
++}
++
+ #[async_trait::async_trait]
+ impl IncomingWebhook for Paypal {
+     fn get_webhook_object_reference_id(
+diff --git a/crates/hyperswitch_connectors/src/connectors/paypal/transformers.rs b/crates/hyperswitch_connectors/src/connectors/paypal/transformers.rs
+index 19faca3..e81365e 100644
+--- a/crates/hyperswitch_connectors/src/connectors/paypal/transformers.rs
++++ b/crates/hyperswitch_connectors/src/connectors/paypal/transformers.rs
+@@ -4633,6 +4633,249 @@ impl TryFrom<RefundsResponseRouterData<RSync, RefundSyncResponse>> for RefundsRo
+     }
+ }
+ 
++pub use self::mergesk_track::{PaypalTrackRequest, PaypalTrackResponse};
++
++/// mergesk patch 0005 (plan 33): request/response of `POST /v2/checkout/orders/{id}/track` (PayPal Orders v2
++/// "Add tracking information for an Order"). Own module so the file-level imports above (touched by patches 0001-0004) stay as they are.
++mod mergesk_track {
++    use hyperswitch_domain_models::{
++        router_flow_types::payments::Track, router_request_types::PaymentsTrackData,
++        router_response_types::PaymentsTrackResponseData, types::PaymentsTrackRouterData,
++    };
++
++    use super::*;
++
++    #[derive(Debug, Clone, Serialize, PartialEq)]
++    pub struct PaypalTrackRequest {
++        pub capture_id: String,
++        pub tracking_number: String,
++        pub carrier: String,
++        #[serde(skip_serializing_if = "Option::is_none")]
++        pub carrier_name_other: Option<String>,
++        pub notify_payer: bool,
++        #[serde(skip_serializing_if = "Option::is_none")]
++        pub items: Option<Vec<PaypalTrackItem>>,
++    }
++
++    #[derive(Debug, Clone, Serialize, PartialEq)]
++    pub struct PaypalTrackItem {
++        pub name: String,
++        pub quantity: String,
++    }
++
++    /// Body from the attempt's `PaypalMeta` (capture id) + the tracking request; no capture id -> the order was never captured here.
++    pub fn build_track_request(
++        connector_meta: Option<serde_json::Value>,
++        request: &PaymentsTrackData,
++    ) -> CustomResult<PaypalTrackRequest, errors::ConnectorError> {
++        let paypal_meta: PaypalMeta = to_connector_meta(connector_meta)?;
++        let capture_id = paypal_meta.capture_id.ok_or(
++            errors::ConnectorError::MissingConnectorRelatedTransactionID {
++                id: "capture_id".to_string(),
++            },
++        )?;
++        let items = if request.items.is_empty() {
++            None
++        } else {
++            Some(
++                request
++                    .items
++                    .iter()
++                    .map(|item| PaypalTrackItem {
++                        name: item.name.clone(),
++                        quantity: item.quantity.clone(),
++                    })
++                    .collect(),
++            )
++        };
++        Ok(PaypalTrackRequest {
++            capture_id,
++            tracking_number: request.tracking_number.clone(),
++            carrier: request.carrier.clone(),
++            carrier_name_other: request.carrier_name_other.clone(),
++            notify_payer: request.notify_payer,
++            items,
++        })
++    }
++
++    impl TryFrom<&PaymentsTrackRouterData> for PaypalTrackRequest {
++        type Error = error_stack::Report<errors::ConnectorError>;
++        fn try_from(item: &PaymentsTrackRouterData) -> Result<Self, Self::Error> {
++            build_track_request(item.request.connector_meta.clone(), &item.request)
++        }
++    }
++
++    /// 201 answers with the order; only the trackers of the purchase unit matter here (everything else is optional on purpose).
++    #[derive(Debug, Clone, Deserialize, Serialize)]
++    pub struct PaypalTrackResponse {
++        pub id: Option<String>,
++        pub status: Option<String>,
++        pub purchase_units: Option<Vec<PaypalTrackPurchaseUnit>>,
++    }
++
++    #[derive(Debug, Clone, Deserialize, Serialize)]
++    pub struct PaypalTrackPurchaseUnit {
++        pub shipping: Option<PaypalTrackShipping>,
++    }
++
++    #[derive(Debug, Clone, Deserialize, Serialize)]
++    pub struct PaypalTrackShipping {
++        pub trackers: Option<Vec<PaypalTracker>>,
++    }
++
++    #[derive(Debug, Clone, Deserialize, Serialize)]
++    pub struct PaypalTracker {
++        pub id: Option<String>,
++        pub status: Option<String>,
++    }
++
++    /// (tracker id, status): the tracker of the response that ends with `-{tracking_number}` (PayPal id = `{capture_id}-{tracking_number}`),
++    /// else that documented id with status SHIPPED (a 201 without trackers still means PayPal accepted it).
++    pub fn tracker_of(
++        response: &PaypalTrackResponse,
++        capture_id: &str,
++        tracking_number: &str,
++    ) -> (String, String) {
++        let suffix = format!("-{tracking_number}");
++        let found = response
++            .purchase_units
++            .iter()
++            .flatten()
++            .filter_map(|unit| unit.shipping.as_ref())
++            .filter_map(|shipping| shipping.trackers.as_ref())
++            .flatten()
++            .filter_map(|tracker| tracker.id.as_ref().map(|id| (id, tracker.status.as_ref())))
++            .filter(|(id, _)| id.ends_with(&suffix))
++            .last()
++            .map(|(id, status)| {
++                (
++                    id.clone(),
++                    status.cloned().unwrap_or_else(|| "SHIPPED".to_string()),
++                )
++            });
++        found.unwrap_or_else(|| (format!("{capture_id}{suffix}"), "SHIPPED".to_string()))
++    }
++
++    impl
++        TryFrom<
++            ResponseRouterData<Track, PaypalTrackResponse, PaymentsTrackData, PaymentsTrackResponseData>,
++        > for PaymentsTrackRouterData
++    {
++        type Error = error_stack::Report<errors::ConnectorError>;
++        fn try_from(
++            item: ResponseRouterData<
++                Track,
++                PaypalTrackResponse,
++                PaymentsTrackData,
++                PaymentsTrackResponseData,
++            >,
++        ) -> Result<Self, Self::Error> {
++            let paypal_meta: PaypalMeta = to_connector_meta(item.data.request.connector_meta.clone())?;
++            let capture_id = paypal_meta.capture_id.unwrap_or_default();
++            let (tracker_id, status) =
++                tracker_of(&item.response, &capture_id, &item.data.request.tracking_number);
++            Ok(Self {
++                response: Ok(PaymentsTrackResponseData { tracker_id, status }),
++                ..item.data
++            })
++        }
++    }
++
++    #[cfg(test)]
++    mod tests {
++        // mergesk patch 0005
++        use super::*;
++
++        fn meta(capture_id: Option<&str>) -> Option<serde_json::Value> {
++            Some(serde_json::json!({
++                "authorize_id": null,
++                "capture_id": capture_id,
++                "incremental_authorization_id": null,
++                "psync_flow": "CAPTURE",
++                "next_action": null,
++                "order_id": null
++            }))
++        }
++
++        fn request(items: Vec<(&str, &str)>, other: Option<&str>) -> PaymentsTrackData {
++            PaymentsTrackData {
++                connector_transaction_id: "1JB90045K08479115".to_string(),
++                connector_meta: meta(Some("3V0017519K696852K")),
++                tracking_number: "9400111899223".to_string(),
++                carrier: if other.is_some() { "OTHER" } else { "USPS" }.to_string(),
++                carrier_name_other: other.map(|s| s.to_string()),
++                notify_payer: false,
++                items: items
++                    .into_iter()
++                    .map(|(name, quantity)| api_models::payments::PaymentsTrackItem {
++                        name: name.to_string(),
++                        quantity: quantity.to_string(),
++                    })
++                    .collect(),
++            }
++        }
++
++        #[test]
++        fn body_has_capture_id_and_paypal_shape() {
++            let body = build_track_request(meta(Some("3V0017519K696852K")), &request(vec![("T-shirt", "2")], None)).unwrap();
++            let json = serde_json::to_value(&body).unwrap();
++            assert_eq!(
++                json,
++                serde_json::json!({
++                    "capture_id": "3V0017519K696852K",
++                    "tracking_number": "9400111899223",
++                    "carrier": "USPS",
++                    "notify_payer": false,
++                    "items": [{"name": "T-shirt", "quantity": "2"}]
++                })
++            );
++        }
++
++        #[test]
++        fn body_omits_empty_items_and_carries_other_name() {
++            let body = build_track_request(meta(Some("CAP1")), &request(vec![], Some("Giao Hang Nhanh"))).unwrap();
++            let json = serde_json::to_value(&body).unwrap();
++            assert_eq!(json.get("items"), None);
++            assert_eq!(json["carrier"], "OTHER");
++            assert_eq!(json["carrier_name_other"], "Giao Hang Nhanh");
++            let json = serde_json::to_value(build_track_request(meta(Some("CAP1")), &request(vec![], None)).unwrap()).unwrap();
++            assert_eq!(json.get("carrier_name_other"), None, "khong gui khoa rong");
++        }
++
++        #[test]
++        fn missing_capture_id_is_a_connector_error() {
++            let err = build_track_request(meta(None), &request(vec![], None)).unwrap_err();
++            assert!(matches!(
++                err.current_context(),
++                errors::ConnectorError::MissingConnectorRelatedTransactionID { id } if id == "capture_id"
++            ));
++        }
++
++        #[test]
++        fn tracker_id_prefers_matching_tracker_else_documented_id() {
++            let full: PaypalTrackResponse = serde_json::from_value(serde_json::json!({
++                "id": "1JB90045K08479115",
++                "status": "COMPLETED",
++                "purchase_units": [{"reference_id": "default", "shipping": {"trackers": [
++                    {"id": "3V0017519K696852K-OLD1", "status": "SHIPPED"},
++                    {"id": "3V0017519K696852K-9400111899223", "status": "ON_HOLD", "items": []}
++                ]}, "payments": {"captures": [{"id": "3V0017519K696852K"}]}}],
++                "links": []
++            }))
++            .unwrap();
++            assert_eq!(
++                tracker_of(&full, "3V0017519K696852K", "9400111899223"),
++                ("3V0017519K696852K-9400111899223".to_string(), "ON_HOLD".to_string())
++            );
++            let bare: PaypalTrackResponse = serde_json::from_value(serde_json::json!({"id": "x"})).unwrap();
++            assert_eq!(
++                tracker_of(&bare, "3V0017519K696852K", "9400111899223"),
++                ("3V0017519K696852K-9400111899223".to_string(), "SHIPPED".to_string())
++            );
++        }
++    }
++}
++
+ #[derive(Default, Clone, Debug, Serialize, Deserialize, PartialEq)]
+ pub struct OrderErrorDetails {
+     pub issue: String,
+diff --git a/crates/hyperswitch_connectors/src/default_implementations.rs b/crates/hyperswitch_connectors/src/default_implementations.rs
+index 356c839..329f822 100644
+--- a/crates/hyperswitch_connectors/src/default_implementations.rs
++++ b/crates/hyperswitch_connectors/src/default_implementations.rs
+@@ -40,7 +40,7 @@ use hyperswitch_domain_models::{
+             ExtendAuthorization, GenerateQr, GiftCardBalanceCheck, IncrementalAuthorization,
+             PostCaptureVoid, PostCaptureVoidSync, PostProcessing, PostSessionTokens,
+             PreAuthorizeVoid, PreProcessing, PushNotification, Reject, SdkSessionUpdate,
+-            SettlementSplitCreate, UpdateMetadata, UpdatePostConfirm,
++            SettlementSplitCreate, Track, UpdateMetadata, UpdatePostConfirm,
+         },
+         subscriptions::{
+             GetSubscriptionEstimate, GetSubscriptionItemPrices, GetSubscriptionItems,
+@@ -79,8 +79,9 @@ use hyperswitch_domain_models::{
+         PaymentsPostAuthenticateData, PaymentsPostProcessingData, PaymentsPostSessionTokensData,
+         PaymentsPreAuthenticateData, PaymentsPreAuthorizeCancelData, PaymentsPreProcessingData,
+         PaymentsRejectData, PaymentsSurchargeCalculationData, PaymentsTaxCalculationData,
+-        PaymentsUpdateMetadataData, PaymentsUpdatePostConfirmData, PushNotificationRequestData,
+-        RetrieveFileRequestData, SdkPaymentsSessionUpdateData, SettlementSplitRequestData,
++        PaymentsTrackData, PaymentsUpdateMetadataData, PaymentsUpdatePostConfirmData,
++        PushNotificationRequestData, RetrieveFileRequestData, SdkPaymentsSessionUpdateData,
++        SettlementSplitRequestData,
+         SubmitEvidenceRequestData, UploadFileRequestData, VaultRequestData,
+         VerifyWebhookSourceRequestData,
+     },
+@@ -97,9 +98,9 @@ use hyperswitch_domain_models::{
+         AcceptDisputeResponse, AuthenticationResponseData, CompleteRefundSurchrgeResponseData,
+         CompleteSurchargeResponseData, DefendDisputeResponse, DisputeSyncResponse,
+         FetchDisputesResponse, GiftCardBalanceCheckResponseData, MandateRevokeResponseData,
+-        PaymentsResponseData, RetrieveFileResponse, SubmitEvidenceResponse,
+-        SurchargeCalculationResponseData, TaxCalculationResponseData, UploadFileResponse,
+-        VaultResponseData, VerifyWebhookSourceResponseData,
++        PaymentsResponseData, PaymentsTrackResponseData, RetrieveFileResponse,
++        SubmitEvidenceResponse, SurchargeCalculationResponseData, TaxCalculationResponseData,
++        UploadFileResponse, VaultResponseData, VerifyWebhookSourceResponseData,
+     },
+ };
+ #[cfg(feature = "frm")]
+@@ -157,7 +158,8 @@ use hyperswitch_interfaces::{
+             PaymentAuthorizeSessionToken, PaymentExtendAuthorization,
+             PaymentIncrementalAuthorization, PaymentPostCaptureVoid, PaymentPostCaptureVoidSync,
+             PaymentPostSessionTokens, PaymentPreAuthorizeVoid, PaymentReject, PaymentSessionUpdate,
+-            PaymentUpdate, PaymentUpdateMetadata, PaymentsAuthenticate, PaymentsCompleteAuthorize,
++            PaymentTrack, PaymentUpdate, PaymentUpdateMetadata, PaymentsAuthenticate,
++            PaymentsCompleteAuthorize,
+             PaymentsCreateOrder, PaymentsGenerateQr, PaymentsGiftCardBalanceCheck,
+             PaymentsPostAuthenticate, PaymentsPostProcessing, PaymentsPreAuthenticate,
+             PaymentsPreProcessing, PaymentsPushNotification, PaymentsSettlementSplitCreate,
+@@ -1179,6 +1181,21 @@ macro_rules! default_imp_for_update_metadata {
+     };
+ }
+ 
++/// mergesk patch 0005: every connector without a `Track` integration gets the default one (no request built)
++macro_rules! default_imp_for_track {
++    ($($path:ident::$connector:ident),*) => {
++        $( impl PaymentTrack for $path::$connector {}
++            impl
++            ConnectorIntegration<
++            Track,
++            PaymentsTrackData,
++            PaymentsTrackResponseData,
++        > for $path::$connector
++        {}
++    )*
++    };
++}
++
+ macro_rules! default_imp_for_update_post_confirm {
+     ($($path:ident::$connector:ident),*) => {
+         $( impl PaymentUpdate for $path::$connector {}
+@@ -1493,6 +1510,158 @@ default_imp_for_update_metadata!(
+     connectors::Zsl,
+     connectors::CtpMastercard
+ );
++// mergesk patch 0005: PayPal has its own Track integration (connectors/paypal.rs), the dummy connector too (connectors/dummyconnector.rs);
++// Stripe is listed here because it implements UpdateMetadata itself and is therefore missing from the list above.
++default_imp_for_track!(
++    connectors::AbsaSanlam,
++    connectors::Santander,
++    connectors::Aci,
++    connectors::Adyen,
++    connectors::Adyenplatform,
++    connectors::Affirm,
++    connectors::Airwallex,
++    connectors::Amazonpay,
++    connectors::Archipel,
++    connectors::Authipay,
++    connectors::Authorizedotnet,
++    connectors::Bambora,
++    connectors::Bamboraapac,
++    connectors::Bankofamerica,
++    connectors::Barclaycard,
++    connectors::Bitpay,
++    connectors::Blackhawknetwork,
++    connectors::Calida,
++    connectors::Bluesnap,
++    connectors::Braintree,
++    connectors::Boku,
++    connectors::Breadpay,
++    connectors::Billwerk,
++    connectors::Cashtocode,
++    connectors::Celero,
++    connectors::Chargebee,
++    connectors::Checkbook,
++    connectors::Checkout,
++    connectors::Coinbase,
++    connectors::Coingate,
++    connectors::Cryptopay,
++    connectors::Custombilling,
++    connectors::Cybersource,
++    connectors::Cybersourcedecisionmanager,
++    connectors::Datatrans,
++    connectors::Digitalvirgo,
++    connectors::Dlocal,
++    connectors::Dwolla,
++    connectors::Ebanx,
++    connectors::Elavon,
++    connectors::Envoy,
++    connectors::Facilitapay,
++    connectors::Finix,
++    connectors::Fiserv,
++    connectors::Fiservcommercehub,
++    connectors::Fiservemea,
++    connectors::Forte,
++    connectors::Getnet,
++    connectors::Gigadat,
++    connectors::Givepayments,
++    connectors::Helcim,
++    connectors::HyperswitchVault,
++    connectors::Hyperwallet,
++    connectors::Iatapay,
++    connectors::Imerchantsolutions,
++    connectors::Inespay,
++    connectors::Interpayments,
++    connectors::Itaubank,
++    connectors::Jpmorgan,
++    connectors::Juspaythreedsserver,
++    connectors::Katapult,
++    connectors::Klarna,
++    connectors::Loonio,
++    connectors::Paysafe,
++    connectors::Rapyd,
++    connectors::Razorpay,
++    connectors::Recurly,
++    connectors::Redsys,
++    connectors::Revolv3,
++    connectors::TsysTransit,
++    connectors::Shift4,
++    connectors::Sift,
++    connectors::Silverflow,
++    connectors::Signifyd,
++    connectors::Square,
++    connectors::Stax,
++    connectors::Stripebilling,
++    connectors::Taxjar,
++    connectors::Tesouro,
++    connectors::Mifinity,
++    connectors::Mollie,
++    connectors::Moneris,
++    connectors::Mpgs,
++    connectors::Multisafepay,
++    connectors::Netcetera,
++    connectors::Nomupay,
++    connectors::Noon,
++    connectors::Nordea,
++    connectors::Novalnet,
++    connectors::Nexinets,
++    connectors::Nexixpay,
++    connectors::Payconex,
++    connectors::Opayo,
++    connectors::Opennode,
++    connectors::Nuvei,
++    connectors::Nmi,
++    connectors::Paybox,
++    connectors::Payeezy,
++    connectors::Payjustnow,
++    connectors::Payjustnowinstore,
++    connectors::Payload,
++    connectors::Payme,
++    connectors::Paystack,
++    connectors::Paytm,
++    connectors::Payu,
++    connectors::Peachpayments,
++    connectors::Phonepe,
++    connectors::Placetopay,
++    connectors::Plaid,
++    connectors::Payone,
++    connectors::Fiuu,
++    connectors::Flexiti,
++    connectors::Globalpay,
++    connectors::Globepay,
++    connectors::Gocardless,
++    connectors::Gpayments,
++    connectors::Hipay,
++    connectors::Hyperpg,
++    connectors::Wise,
++    connectors::Worldline,
++    connectors::Worldpay,
++    connectors::Worldpaymodular,
++    connectors::Worldpayvantiv,
++    connectors::Worldpayxml,
++    connectors::Wellsfargo,
++    connectors::Wellsfargopayout,
++    connectors::Xendit,
++    connectors::Zift,
++    connectors::Powertranz,
++    connectors::Prophetpay,
++    connectors::Riskified,
++    connectors::Threedsecureio,
++    connectors::Thunes,
++    connectors::Tokenex,
++    connectors::Tokenio,
++    connectors::Truelayer,
++    connectors::Trustly,
++    connectors::Trustpay,
++    connectors::Trustpayments,
++    connectors::Tsys,
++    connectors::UnifiedAuthenticationService,
++    connectors::Deutschebank,
++    connectors::Vgs,
++    connectors::Volt,
++    connectors::Zen,
++    connectors::Zsl,
++    connectors::CtpMastercard,
++    connectors::Stripe
++);
+ 
+ macro_rules! default_imp_for_cancel_post_capture {
+     ($($path:ident::$connector:ident),*) => {
+diff --git a/crates/hyperswitch_connectors/src/default_implementations_v2.rs b/crates/hyperswitch_connectors/src/default_implementations_v2.rs
+index 13532c0..5e17a5d 100644
+--- a/crates/hyperswitch_connectors/src/default_implementations_v2.rs
++++ b/crates/hyperswitch_connectors/src/default_implementations_v2.rs
+@@ -27,7 +27,8 @@ use hyperswitch_domain_models::{
+             IncrementalAuthorization, PSync, PaymentMethodToken, PostCaptureVoid,
+             PostCaptureVoidSync, PostProcessing, PostSessionTokens, PreAuthorizeVoid,
+             PreProcessing, PushNotification, Reject, SdkSessionUpdate, Session,
+-            SettlementSplitCreate, SetupMandate, UpdateMetadata, UpdatePostConfirm, Void,
++            SettlementSplitCreate, SetupMandate, Track, UpdateMetadata, UpdatePostConfirm,
++            Void,
+         },
+         refunds::{Execute, RSync},
+         revenue_recovery::{
+@@ -59,9 +60,10 @@ use hyperswitch_domain_models::{
+         PaymentsPostAuthenticateData, PaymentsPostProcessingData, PaymentsPostSessionTokensData,
+         PaymentsPreAuthenticateData, PaymentsPreAuthorizeCancelData, PaymentsPreProcessingData,
+         PaymentsRejectData, PaymentsSessionData, PaymentsSurchargeCalculationData,
+-        PaymentsSyncData, PaymentsTaxCalculationData, PaymentsUpdateMetadataData,
+-        PaymentsUpdatePostConfirmData, PushNotificationRequestData, RefundsData,
+-        RetrieveFileRequestData, SdkPaymentsSessionUpdateData, SettlementSplitRequestData,
++        PaymentsSyncData, PaymentsTaxCalculationData, PaymentsTrackData,
++        PaymentsUpdateMetadataData, PaymentsUpdatePostConfirmData, PushNotificationRequestData,
++        RefundsData, RetrieveFileRequestData, SdkPaymentsSessionUpdateData,
++        SettlementSplitRequestData,
+         SetupMandateRequestData, SubmitEvidenceRequestData, UploadFileRequestData,
+         VaultRequestData, VerifyWebhookSourceRequestData,
+     },
+@@ -76,8 +78,9 @@ use hyperswitch_domain_models::{
+         AcceptDisputeResponse, AuthenticationResponseData, CompleteRefundSurchrgeResponseData,
+         CompleteSurchargeResponseData, DefendDisputeResponse, DisputeSyncResponse,
+         FetchDisputesResponse, GiftCardBalanceCheckResponseData, MandateRevokeResponseData,
+-        PaymentsResponseData, RefundsResponseData, RetrieveFileResponse, SubmitEvidenceResponse,
+-        SurchargeCalculationResponseData, TaxCalculationResponseData, UploadFileResponse,
++        PaymentsResponseData, PaymentsTrackResponseData, RefundsResponseData, RetrieveFileResponse,
++        SubmitEvidenceResponse, SurchargeCalculationResponseData, TaxCalculationResponseData,
++        UploadFileResponse,
+         VaultResponseData, VerifyWebhookSourceResponseData,
+     },
+ };
+@@ -130,7 +133,8 @@ use hyperswitch_interfaces::{
+             PaymentCreateOrderV2, PaymentExtendAuthorizationV2, PaymentIncrementalAuthorizationV2,
+             PaymentPostCaptureVoidSyncV2, PaymentPostCaptureVoidV2, PaymentPostSessionTokensV2,
+             PaymentPreAuthorizeVoidV2, PaymentRejectV2, PaymentSessionUpdateV2, PaymentSessionV2,
+-            PaymentSyncV2, PaymentTokenV2, PaymentUpdateMetadataV2, PaymentUpdatePostConfirmV2,
++            PaymentSyncV2, PaymentTokenV2, PaymentTrackV2, PaymentUpdateMetadataV2,
++            PaymentUpdatePostConfirmV2,
+             PaymentV2, PaymentVoidV2, PaymentsAuthenticateV2, PaymentsCompleteAuthorizeV2,
+             PaymentsGenerateQrV2, PaymentsGiftCardBalanceCheckV2, PaymentsPostAuthenticateV2,
+             PaymentsPostProcessingV2, PaymentsPreAuthenticateV2, PaymentsPreProcessingV2,
+@@ -191,6 +195,7 @@ macro_rules! default_imp_for_new_connector_integration_payment {
+             impl PaymentSessionUpdateV2 for $path::$connector{}
+             impl PaymentPostSessionTokensV2 for $path::$connector{}
+             impl PaymentUpdateMetadataV2 for $path::$connector{}
++            impl PaymentTrackV2 for $path::$connector{}
+             impl PaymentUpdatePostConfirmV2 for $path::$connector{}
+             impl PaymentCreateOrderV2 for $path::$connector{}
+             impl ExternalVaultV2 for $path::$connector{}
+@@ -354,6 +359,13 @@ macro_rules! default_imp_for_new_connector_integration_payment {
+             > for $path::$connector{}
+             impl
+             ConnectorIntegrationV2<
++            Track,
++            PaymentFlowData,
++            PaymentsTrackData,
++            PaymentsTrackResponseData,
++            > for $path::$connector{}
++            impl
++            ConnectorIntegrationV2<
+             UpdatePostConfirm,
+             PaymentFlowData,
+             PaymentsUpdatePostConfirmData,
+diff --git a/crates/hyperswitch_domain_models/src/router_flow_types/payments.rs b/crates/hyperswitch_domain_models/src/router_flow_types/payments.rs
+index d01dcb9..cd4616e 100644
+--- a/crates/hyperswitch_domain_models/src/router_flow_types/payments.rs
++++ b/crates/hyperswitch_domain_models/src/router_flow_types/payments.rs
+@@ -101,6 +101,10 @@ pub struct RecordAttempt;
+ #[derive(Debug, Clone)]
+ pub struct UpdateMetadata;
+ 
++/// mergesk patch 0005: send shipment tracking to the connector
++#[derive(Debug, Clone)]
++pub struct Track;
++
+ #[derive(Debug, Clone)]
+ pub struct CreateOrder;
+ 
+diff --git a/crates/hyperswitch_domain_models/src/router_request_types.rs b/crates/hyperswitch_domain_models/src/router_request_types.rs
+index 71829a7..aba3494 100644
+--- a/crates/hyperswitch_domain_models/src/router_request_types.rs
++++ b/crates/hyperswitch_domain_models/src/router_request_types.rs
+@@ -294,6 +294,20 @@ pub struct PaymentsUpdateMetadataData {
+     pub connector_transaction_id: String,
+ }
+ 
++/// mergesk patch 0005: shipment tracking request to the connector of a captured payment
++#[derive(Debug, Clone, Serialize)]
++pub struct PaymentsTrackData {
++    /// connector transaction id of the successful attempt (PayPal: order id)
++    pub connector_transaction_id: String,
++    /// connector_metadata of that attempt (PayPal: `PaypalMeta` with `capture_id`)
++    pub connector_meta: Option<serde_json::Value>,
++    pub tracking_number: String,
++    pub carrier: String,
++    pub carrier_name_other: Option<String>,
++    pub notify_payer: bool,
++    pub items: Vec<api_models::payments::PaymentsTrackItem>,
++}
++
+ #[derive(Debug, Clone, Serialize)]
+ pub struct PaymentsUpdatePostConfirmData {
+     pub feature_metadata: Option<api_models::payments::FeatureMetadata>,
+diff --git a/crates/hyperswitch_domain_models/src/router_response_types.rs b/crates/hyperswitch_domain_models/src/router_response_types.rs
+index ecf806d..d2fb565 100644
+--- a/crates/hyperswitch_domain_models/src/router_response_types.rs
++++ b/crates/hyperswitch_domain_models/src/router_response_types.rs
+@@ -27,6 +27,13 @@ pub struct RefundsResponseData {
+     // pub amount_received: Option<i32>, // Calculation for amount received not in place yet
+ }
+ 
++/// mergesk patch 0005: what the connector answered to a shipment tracking request
++#[derive(Debug, Clone, serde::Serialize)]
++pub struct PaymentsTrackResponseData {
++    pub tracker_id: String,
++    pub status: String,
++}
++
+ #[derive(Debug, Clone, Serialize)]
+ pub struct ConnectorCustomerResponseData {
+     pub connector_customer_id: String,
+diff --git a/crates/hyperswitch_domain_models/src/types.rs b/crates/hyperswitch_domain_models/src/types.rs
+index 99846dd..5ea6e8e 100644
+--- a/crates/hyperswitch_domain_models/src/types.rs
++++ b/crates/hyperswitch_domain_models/src/types.rs
+@@ -21,7 +21,7 @@ use crate::{
+         IncrementalAuthorization, PSync, PaymentMethodToken, PostAuthenticate, PostCaptureVoid,
+         PostCaptureVoidSync, PostSessionTokens, PreAuthenticate, PreAuthorizeVoid, PreProcessing,
+         ProcessIncomingWebhook, PushNotification, RSync, SdkSessionUpdate, Session,
+-        SettlementSplitCreate, SetupMandate, UpdateMetadata, UpdatePostConfirm,
++        SettlementSplitCreate, SetupMandate, Track, UpdateMetadata, UpdatePostConfirm,
+         VerifyWebhookSource, Void,
+     },
+     router_request_types::{
+@@ -52,7 +52,7 @@ use crate::{
+         PaymentsIncrementalAuthorizationData, PaymentsPostAuthenticateData,
+         PaymentsPostSessionTokensData, PaymentsPreAuthenticateData, PaymentsPreAuthorizeCancelData,
+         PaymentsPreProcessingData, PaymentsSessionData, PaymentsSurchargeCalculationData,
+-        PaymentsSyncData, PaymentsTaxCalculationData, PaymentsUpdateMetadataData,
++        PaymentsSyncData, PaymentsTaxCalculationData, PaymentsTrackData, PaymentsUpdateMetadataData,
+         PaymentsUpdatePostConfirmData, PushNotificationRequestData, RefundsData,
+         SdkPaymentsSessionUpdateData, SettlementSplitRequestData, SetupMandateRequestData,
+         VaultRequestData, VerifyWebhookSourceRequestData,
+@@ -72,8 +72,8 @@ use crate::{
+         },
+         CompleteRefundSurchrgeResponseData, CompleteSurchargeResponseData,
+         GiftCardBalanceCheckResponseData, MandateRevokeResponseData, PaymentsResponseData,
+-        RefundsResponseData, SurchargeCalculationResponseData, TaxCalculationResponseData,
+-        VaultResponseData, VerifyWebhookSourceResponseData,
++        PaymentsTrackResponseData, RefundsResponseData, SurchargeCalculationResponseData,
++        TaxCalculationResponseData, VaultResponseData, VerifyWebhookSourceResponseData,
+     },
+ };
+ #[cfg(feature = "payouts")]
+@@ -149,6 +149,8 @@ pub type PaymentsPostSessionTokensRouterData =
+ pub type PaymentsSessionRouterData = RouterData<Session, PaymentsSessionData, PaymentsResponseData>;
+ pub type PaymentsUpdateMetadataRouterData =
+     RouterData<UpdateMetadata, PaymentsUpdateMetadataData, PaymentsResponseData>;
++/// mergesk patch 0005
++pub type PaymentsTrackRouterData = RouterData<Track, PaymentsTrackData, PaymentsTrackResponseData>;
+ pub type PaymentsUpdatePostConfirmRouterData =
+     RouterData<UpdatePostConfirm, PaymentsUpdatePostConfirmData, PaymentsResponseData>;
+ pub type CreateOrderRouterData =
+diff --git a/crates/hyperswitch_interfaces/src/api/payments.rs b/crates/hyperswitch_interfaces/src/api/payments.rs
+index c2d4687..559a858 100644
+--- a/crates/hyperswitch_interfaces/src/api/payments.rs
++++ b/crates/hyperswitch_interfaces/src/api/payments.rs
+@@ -8,7 +8,7 @@ use hyperswitch_domain_models::{
+             ExtendAuthorization, GenerateQr, IncrementalAuthorization, PSync, PaymentMethodToken,
+             PostCaptureVoid, PostCaptureVoidSync, PostProcessing, PostSessionTokens,
+             PreAuthorizeVoid, PreProcessing, PushNotification, Reject, SdkSessionUpdate, Session,
+-            SettlementSplitCreate, SetupMandate, UpdateMetadata, Void,
++            SettlementSplitCreate, SetupMandate, Track, UpdateMetadata, Void,
+         },
+         Authenticate, CreateOrder, ExternalVaultProxy, GiftCardBalanceCheck, PostAuthenticate,
+         PreAuthenticate, UpdatePostConfirm,
+@@ -24,14 +24,15 @@ use hyperswitch_domain_models::{
+         PaymentsPostAuthenticateData, PaymentsPostProcessingData, PaymentsPostSessionTokensData,
+         PaymentsPreAuthenticateData, PaymentsPreAuthorizeCancelData, PaymentsPreProcessingData,
+         PaymentsRejectData, PaymentsSessionData, PaymentsSurchargeCalculationData,
+-        PaymentsSyncData, PaymentsTaxCalculationData, PaymentsUpdateMetadataData,
+-        PaymentsUpdatePostConfirmData, PushNotificationRequestData, SdkPaymentsSessionUpdateData,
++        PaymentsSyncData, PaymentsTaxCalculationData, PaymentsTrackData,
++        PaymentsUpdateMetadataData, PaymentsUpdatePostConfirmData, PushNotificationRequestData,
++        SdkPaymentsSessionUpdateData,
+         SettlementSplitRequestData, SetupMandateRequestData,
+     },
+     router_response_types::{
+         CompleteRefundSurchrgeResponseData, CompleteSurchargeResponseData,
+-        GiftCardBalanceCheckResponseData, PaymentsResponseData, SurchargeCalculationResponseData,
+-        TaxCalculationResponseData,
++        GiftCardBalanceCheckResponseData, PaymentsResponseData, PaymentsTrackResponseData,
++        SurchargeCalculationResponseData, TaxCalculationResponseData,
+     },
+ };
+ 
+@@ -68,6 +69,7 @@ pub trait Payment:
+     + PaymentSessionUpdate
+     + PaymentPostSessionTokens
+     + PaymentUpdateMetadata
++    + PaymentTrack
+     + PaymentsCreateOrder
+     + ExternalVaultProxyPaymentsCreateV1
+     + PaymentsSettlementSplitCreate
+@@ -232,6 +234,12 @@ pub trait PaymentUpdateMetadata:
+ {
+ }
+ 
++/// trait Track (mergesk patch 0005: shipment tracking to the connector)
++pub trait PaymentTrack:
++    api::ConnectorIntegration<Track, PaymentsTrackData, PaymentsTrackResponseData>
++{
++}
++
+ /// trait UpdatePostConfirm
+ pub trait PaymentUpdate:
+     api::ConnectorIntegration<UpdatePostConfirm, PaymentsUpdatePostConfirmData, PaymentsResponseData>
+diff --git a/crates/hyperswitch_interfaces/src/api/payments_v2.rs b/crates/hyperswitch_interfaces/src/api/payments_v2.rs
+index 73326da..2f317c3 100644
+--- a/crates/hyperswitch_interfaces/src/api/payments_v2.rs
++++ b/crates/hyperswitch_interfaces/src/api/payments_v2.rs
+@@ -10,7 +10,7 @@ use hyperswitch_domain_models::{
+             IncrementalAuthorization, PSync, PaymentMethodToken, PostCaptureVoid,
+             PostCaptureVoidSync, PostProcessing, PostSessionTokens, PreAuthorizeVoid,
+             PreProcessing, PushNotification, Reject, SdkSessionUpdate, Session,
+-            SettlementSplitCreate, SetupMandate, UpdateMetadata, UpdatePostConfirm, Void,
++            SettlementSplitCreate, SetupMandate, Track, UpdateMetadata, UpdatePostConfirm, Void,
+         },
+         Authenticate, GiftCardBalanceCheck, PostAuthenticate, PreAuthenticate,
+     },
+@@ -25,14 +25,15 @@ use hyperswitch_domain_models::{
+         PaymentsPostAuthenticateData, PaymentsPostProcessingData, PaymentsPostSessionTokensData,
+         PaymentsPreAuthenticateData, PaymentsPreAuthorizeCancelData, PaymentsPreProcessingData,
+         PaymentsRejectData, PaymentsSessionData, PaymentsSurchargeCalculationData,
+-        PaymentsSyncData, PaymentsTaxCalculationData, PaymentsUpdateMetadataData,
+-        PaymentsUpdatePostConfirmData, PushNotificationRequestData, SdkPaymentsSessionUpdateData,
++        PaymentsSyncData, PaymentsTaxCalculationData, PaymentsTrackData,
++        PaymentsUpdateMetadataData, PaymentsUpdatePostConfirmData, PushNotificationRequestData,
++        SdkPaymentsSessionUpdateData,
+         SettlementSplitRequestData, SetupMandateRequestData,
+     },
+     router_response_types::{
+         CompleteRefundSurchrgeResponseData, CompleteSurchargeResponseData,
+-        GiftCardBalanceCheckResponseData, PaymentsResponseData, SurchargeCalculationResponseData,
+-        TaxCalculationResponseData,
++        GiftCardBalanceCheckResponseData, PaymentsResponseData, PaymentsTrackResponseData,
++        SurchargeCalculationResponseData, TaxCalculationResponseData,
+     },
+ };
+ 
+@@ -237,6 +238,12 @@ pub trait PaymentUpdateMetadataV2:
+ {
+ }
+ 
++/// trait PaymentTrackV2 (mergesk patch 0005)
++pub trait PaymentTrackV2:
++    ConnectorIntegrationV2<Track, PaymentFlowData, PaymentsTrackData, PaymentsTrackResponseData>
++{
++}
++
+ /// trait PaymentUpdatePostConfirmV2
+ pub trait PaymentUpdatePostConfirmV2:
+     ConnectorIntegrationV2<
+@@ -417,6 +424,7 @@ pub trait PaymentV2:
+     + PaymentSessionUpdateV2
+     + PaymentPostSessionTokensV2
+     + PaymentUpdateMetadataV2
++    + PaymentTrackV2
+     + PaymentCreateOrderV2
+     + ExternalVaultProxyPaymentsCreate
+     + PaymentsSettlementSplitCreate
+diff --git a/crates/hyperswitch_interfaces/src/types.rs b/crates/hyperswitch_interfaces/src/types.rs
+index f954f4e..29f7a76 100644
+--- a/crates/hyperswitch_interfaces/src/types.rs
++++ b/crates/hyperswitch_interfaces/src/types.rs
+@@ -17,7 +17,8 @@ use hyperswitch_domain_models::{
+             CreateOrder, ExtendAuthorization, GenerateQr, IncrementalAuthorization, InitPayment,
+             PSync, PaymentMethodToken, PostCaptureVoid, PostCaptureVoidSync, PostProcessing,
+             PostSessionTokens, PreAuthorizeVoid, PreProcessing, PushNotification, SdkSessionUpdate,
+-            Session, SettlementSplitCreate, SetupMandate, UpdateMetadata, UpdatePostConfirm, Void,
++            Session, SettlementSplitCreate, SetupMandate, Track, UpdateMetadata, UpdatePostConfirm,
++            Void,
+         },
+         refunds::{Execute, RSync},
+         revenue_recovery::{BillingConnectorPaymentsSync, InvoiceRecordBack},
+@@ -66,8 +67,9 @@ use hyperswitch_domain_models::{
+         PaymentsPostProcessingData, PaymentsPostSessionTokensData, PaymentsPreAuthenticateData,
+         PaymentsPreAuthorizeCancelData, PaymentsPreProcessingData, PaymentsSessionData,
+         PaymentsSurchargeCalculationData, PaymentsSyncData, PaymentsTaxCalculationData,
+-        PaymentsUpdateMetadataData, PaymentsUpdatePostConfirmData, PushNotificationRequestData,
+-        RefundsData, RetrieveFileRequestData, SdkPaymentsSessionUpdateData,
++        PaymentsTrackData, PaymentsUpdateMetadataData, PaymentsUpdatePostConfirmData,
++        PushNotificationRequestData, RefundsData, RetrieveFileRequestData,
++        SdkPaymentsSessionUpdateData,
+         SettlementSplitRequestData, SetupMandateRequestData, SubmitEvidenceRequestData,
+         UploadFileRequestData, VaultRequestData, VerifyWebhookSourceRequestData,
+     },
+@@ -87,7 +89,8 @@ use hyperswitch_domain_models::{
+         AcceptDisputeResponse, CompleteRefundSurchrgeResponseData, CompleteSurchargeResponseData,
+         DefendDisputeResponse, DisputeSyncResponse, FetchDisputesResponse,
+         GiftCardBalanceCheckResponseData, MandateRevokeResponseData, PaymentsResponseData,
+-        RefundsResponseData, RetrieveFileResponse, SubmitEvidenceResponse,
++        PaymentsTrackResponseData, RefundsResponseData, RetrieveFileResponse,
++        SubmitEvidenceResponse,
+         SurchargeCalculationResponseData, TaxCalculationResponseData, UploadFileResponse,
+         VaultResponseData, VerifyWebhookSourceResponseData,
+     },
+@@ -162,6 +165,9 @@ pub type PaymentsPostSessionTokensType = dyn ConnectorIntegration<
+ /// Type alias for `ConnectorIntegration<UpdateMetadata, PaymentsUpdateMetadataData, PaymentsResponseData>`
+ pub type PaymentsUpdateMetadataType =
+     dyn ConnectorIntegration<UpdateMetadata, PaymentsUpdateMetadataData, PaymentsResponseData>;
++/// Type alias for `ConnectorIntegration<Track, PaymentsTrackData, PaymentsTrackResponseData>` (mergesk patch 0005)
++pub type PaymentsTrackType =
++    dyn ConnectorIntegration<Track, PaymentsTrackData, PaymentsTrackResponseData>;
+ /// Type alias for `ConnectorIntegration<UpdatePostConfirm, PaymentsUpdatePostConfirmData, PaymentsResponseData>`
+ pub type PaymentsUpdatePostConfirmType = dyn ConnectorIntegration<
+     UpdatePostConfirm,
+diff --git a/crates/router/src/core.rs b/crates/router/src/core.rs
+index ce25204..10d666e 100644
+--- a/crates/router/src/core.rs
++++ b/crates/router/src/core.rs
+@@ -56,6 +56,8 @@ pub mod profile_acquirer;
+ pub mod proxy;
+ #[cfg(feature = "v1")]
+ pub mod refunds;
++#[cfg(feature = "v1")]
++pub mod track;
+ #[cfg(feature = "v2")]
+ pub mod refunds_v2;
+ pub mod relay;
+diff --git a/crates/router/src/core/track.rs b/crates/router/src/core/track.rs
+new file mode 100644
+index 0000000..a15499d
+--- /dev/null
++++ b/crates/router/src/core/track.rs
+@@ -0,0 +1,400 @@
++//! mergesk patch 0005 (plan 33): send the shipment tracking of a captured payment to its connector
++//! (`POST /payments/{payment_id}/track`; PayPal `POST /v2/checkout/orders/{id}/track`).
++//!
++//! Shaped like a refund (core/refunds.rs `trigger_refund_to_gateway`): payment intent + last successful attempt of the
++//! merchant, connector account of that attempt, access token, one connector call, nothing stored. Outcome:
++//! connector accepted -> 200 `status: sent` + tracker id; connector refused (4xx except 429) -> 200 `status: failed` +
++//! its error code/message (definite, the caller must not retry blindly); connector/transport failure (5xx, 429, timeout)
++//! -> `ExternalConnectorError` with the connector's status (retry later); the attempt lacks the capture id / connector
++//! metadata -> `PreconditionFailed` (IR_16, definite); connector without a Track integration -> `FlowNotSupported`.
++
++use api_models::payments::{PaymentsTrackRequest, PaymentsTrackResponse, PaymentsTrackStatus};
++use common_utils::ext_traits::ValueExt;
++use error_stack::{report, ResultExt};
++use external_services::grpc_client::LineageIds;
++use hyperswitch_domain_models::payments::HeaderPayload;
++use hyperswitch_interfaces::consts as interfaces_consts;
++use router_env::{instrument, tracing};
++
++use crate::{
++    core::{
++        errors::{self, RouterResponse, RouterResult, StorageErrorExt},
++        payments::{self, access_token, gateway::context as gateway_context, helpers},
++    },
++    routes::SessionState,
++    services,
++    types::{self, api, domain, storage, storage::enums, PaymentAddress},
++    utils::{self, OptionExt},
++};
++
++const FLOW_NAME: &str = "Track";
++/// Put in the router data before the connector call; a connector whose `Track` integration is the default one builds no request and
++/// hands the router data back unchanged, so this message tells "not implemented" apart from a connector refusal.
++const NOT_IMPLEMENTED_MESSAGE: &str = "track: the connector built no request";
++
++#[instrument(skip_all)]
++pub async fn payments_track_core(
++    state: SessionState,
++    platform: domain::Platform,
++    req: PaymentsTrackRequest,
++) -> RouterResponse<PaymentsTrackResponse> {
++    validate(&req)?;
++    let db = &*state.store;
++    let processor = platform.get_processor();
++    let processor_merchant_id = processor.get_account().get_id();
++    let storage_scheme = processor.get_account().storage_scheme;
++
++    let payment_intent = db
++        .find_payment_intent_by_payment_id_processor_merchant_id(
++            &req.payment_id,
++            processor_merchant_id,
++            processor.get_key_store(),
++            storage_scheme,
++        )
++        .await
++        .to_not_found_response(errors::ApiErrorResponse::PaymentNotFound)?;
++
++    utils::when(
++        !(payment_intent.status == enums::IntentStatus::Succeeded
++            || payment_intent.status == enums::IntentStatus::PartiallyCaptured),
++        || {
++            Err(report!(errors::ApiErrorResponse::PaymentUnexpectedState {
++                current_flow: "track".into(),
++                field_name: "status".into(),
++                current_value: payment_intent.status.to_string(),
++                states: "succeeded, partially_captured".to_string(),
++            })
++            .attach_printable("unable to track a payment that is not captured"))
++        },
++    )?;
++
++    let payment_attempt = db
++        .find_payment_attempt_last_successful_or_partially_captured_attempt_by_payment_id_processor_merchant_id(
++            &req.payment_id,
++            processor_merchant_id,
++            storage_scheme,
++            processor.get_key_store(),
++        )
++        .await
++        .to_not_found_response(errors::ApiErrorResponse::SuccessfulPaymentNotFound)?;
++
++    let connector_transaction_id = payment_attempt
++        .get_connector_payment_id()
++        .ok_or(errors::ApiErrorResponse::InternalServerError)
++        .attach_printable("connector_transaction_id missing on the successful payment attempt")?
++        .to_string();
++    let routed_through = payment_attempt
++        .connector
++        .clone()
++        .ok_or(errors::ApiErrorResponse::InternalServerError)
++        .attach_printable("Failed to retrieve connector from payment attempt")?;
++    let connector: api::ConnectorData = api::ConnectorData::get_connector_by_name(
++        &state.conf.connectors,
++        &routed_through,
++        api::GetToken::Connector,
++        payment_attempt.merchant_connector_id.clone(),
++    )?;
++    let profile_id = payment_intent
++        .profile_id
++        .as_ref()
++        .get_required_value("profile_id")
++        .change_context(errors::ApiErrorResponse::InternalServerError)
++        .attach_printable("profile_id is not set in payment_intent")?;
++    let merchant_connector_account = helpers::get_merchant_connector_account(
++        &state,
++        processor,
++        None,
++        profile_id,
++        &routed_through,
++        payment_attempt.merchant_connector_id.as_ref(),
++    )
++    .await?;
++
++    let mut router_data = construct_track_router_data(
++        &state,
++        &routed_through,
++        processor,
++        &payment_intent,
++        &payment_attempt,
++        &merchant_connector_account,
++        connector_transaction_id,
++        &req,
++    )?;
++
++    let lineage_ids = LineageIds::new(payment_intent.merchant_id.clone(), profile_id.clone());
++    let gateway_context = gateway_context::RouterGatewayContext {
++        creds_identifier: None,
++        processor: processor.clone(),
++        header_payload: HeaderPayload::default(),
++        lineage_ids,
++        merchant_connector_account: merchant_connector_account.clone(),
++        execution_path: common_enums::ExecutionPath::Direct,
++        execution_mode: common_enums::ExecutionMode::NotApplicable,
++    };
++    let add_access_token_result = Box::pin(access_token::add_access_token(
++        &state,
++        &connector,
++        &router_data,
++        None,
++        &gateway_context,
++        None,
++    ))
++    .await?;
++    access_token::update_router_data_with_access_token_result(
++        &add_access_token_result,
++        &mut router_data,
++        &payments::CallConnectorAction::Trigger,
++    );
++
++    let router_data = if add_access_token_result.connector_supports_access_token
++        && router_data.access_token.is_none()
++    {
++        // the access token call failed: its error is already in router_data.response
++        router_data
++    } else {
++        let connector_integration: services::BoxedPaymentConnectorIntegrationInterface<
++            api::Track,
++            types::PaymentsTrackData,
++            types::PaymentsTrackResponseData,
++        > = connector.connector.get_connector_integration();
++        services::execute_connector_processing_step(
++            &state,
++            connector_integration,
++            &router_data,
++            payments::CallConnectorAction::Trigger,
++            None,
++            None,
++        )
++        .await
++        .map_err(|err| to_api_error(err, &routed_through))?
++    };
++
++    let response = match router_data.response {
++        Ok(data) => PaymentsTrackResponse {
++            payment_id: req.payment_id.clone(),
++            status: PaymentsTrackStatus::Sent,
++            tracker_id: Some(data.tracker_id),
++            error_code: None,
++            error_message: None,
++        },
++        Err(err) if err.message == NOT_IMPLEMENTED_MESSAGE => {
++            return Err(report!(errors::ApiErrorResponse::FlowNotSupported {
++                flow: FLOW_NAME.to_string(),
++                connector: routed_through,
++            }));
++        }
++        Err(err)
++            if err.status_code >= 500
++                || err.status_code == 429
++                || err.code == interfaces_consts::REQUEST_TIMEOUT_ERROR_CODE =>
++        {
++            return Err(report!(errors::ApiErrorResponse::ExternalConnectorError {
++                code: err.code,
++                message: err.reason.unwrap_or(err.message),
++                connector: routed_through,
++                status_code: err.status_code,
++                reason: None,
++            }));
++        }
++        Err(err) => PaymentsTrackResponse {
++            payment_id: req.payment_id.clone(),
++            status: PaymentsTrackStatus::Failed,
++            tracker_id: None,
++            error_code: Some(err.code),
++            error_message: Some(err.reason.unwrap_or(err.message)),
++        },
++    };
++    Ok(services::ApplicationResponse::Json(response))
++}
++
++fn validate(req: &PaymentsTrackRequest) -> RouterResult<()> {
++    let number = req.tracking_number.trim();
++    utils::when(number.is_empty() || number.chars().count() > 64, || {
++        Err(report!(errors::ApiErrorResponse::InvalidDataFormat {
++            field_name: "tracking_number".to_string(),
++            expected_format: "1 to 64 characters".to_string(),
++        }))
++    })?;
++    let carrier = req.carrier.trim();
++    utils::when(carrier.is_empty() || carrier.chars().count() > 64, || {
++        Err(report!(errors::ApiErrorResponse::InvalidDataFormat {
++            field_name: "carrier".to_string(),
++            expected_format: "1 to 64 characters (connector carrier code)".to_string(),
++        }))
++    })?;
++    utils::when(
++        carrier == "OTHER"
++            && req
++                .carrier_name_other
++                .as_deref()
++                .map(str::trim)
++                .unwrap_or_default()
++                .is_empty(),
++        || {
++            Err(report!(errors::ApiErrorResponse::MissingRequiredField {
++                field_name: "carrier_name_other",
++            }))
++        },
++    )?;
++    for item in req.items.iter().flatten() {
++        utils::when(
++            item.name.trim().is_empty() || item.quantity.trim().is_empty(),
++            || {
++                Err(report!(errors::ApiErrorResponse::InvalidDataFormat {
++                    field_name: "items".to_string(),
++                    expected_format: "name and quantity per item".to_string(),
++                }))
++            },
++        )?;
++    }
++    Ok(())
++}
++
++/// Transport / encoding failures of the connector call (no HTTP answer to pass on).
++fn to_api_error(
++    err: error_stack::Report<errors::ConnectorError>,
++    connector: &str,
++) -> error_stack::Report<errors::ApiErrorResponse> {
++    let api_error = match err.current_context() {
++        errors::ConnectorError::NotImplemented(_) | errors::ConnectorError::FlowNotSupported { .. } => {
++            errors::ApiErrorResponse::FlowNotSupported {
++                flow: FLOW_NAME.to_string(),
++                connector: connector.to_string(),
++            }
++        }
++        // mergesk T3(2): the attempt lacks data the connector needs (PayPal: capture id in PaypalMeta) -> definite 4xx (spec 6 T3)
++        errors::ConnectorError::MissingConnectorRelatedTransactionID { id } => {
++            errors::ApiErrorResponse::PreconditionFailed {
++                message: format!("track: the successful payment attempt has no {id} for {connector} (not retryable)"),
++            }
++        }
++        errors::ConnectorError::MissingRequiredField { field_name } => {
++            errors::ApiErrorResponse::PreconditionFailed {
++                message: format!("track: the successful payment attempt has no {field_name} for {connector} (not retryable)"),
++            }
++        }
++        other => errors::ApiErrorResponse::ExternalConnectorError {
++            code: interfaces_consts::NO_ERROR_CODE.to_string(),
++            message: other.to_string(),
++            connector: connector.to_string(),
++            status_code: 500,
++            reason: None,
++        },
++    };
++    err.change_context(api_error)
++}
++
++#[allow(clippy::too_many_arguments)]
++fn construct_track_router_data(
++    state: &SessionState,
++    connector_id: &str,
++    processor: &domain::Processor,
++    payment_intent: &storage::PaymentIntent,
++    payment_attempt: &storage::PaymentAttempt,
++    merchant_connector_account: &helpers::MerchantConnectorAccountType,
++    connector_transaction_id: String,
++    req: &PaymentsTrackRequest,
++) -> RouterResult<types::PaymentsTrackRouterData> {
++    let auth_type: types::ConnectorAuthType = merchant_connector_account
++        .get_connector_account_details()
++        .parse_value("ConnectorAuthType")
++        .change_context(errors::ApiErrorResponse::InternalServerError)?;
++    let payment_method = payment_attempt
++        .payment_method
++        .get_required_value("payment_method")
++        .change_context(errors::ApiErrorResponse::InternalServerError)?;
++    let tracking_number = req.tracking_number.trim().to_string();
++    let request = types::PaymentsTrackData {
++        connector_transaction_id,
++        connector_meta: payment_attempt.connector_metadata.clone(),
++        tracking_number: tracking_number.clone(),
++        carrier: req.carrier.trim().to_string(),
++        carrier_name_other: req
++            .carrier_name_other
++            .as_deref()
++            .map(str::trim)
++            .filter(|name| !name.is_empty())
++            .map(str::to_string),
++        notify_payer: req.notify_payer.unwrap_or(false),
++        items: req.items.clone().unwrap_or_default(),
++    };
++    Ok(types::RouterData {
++        flow: std::marker::PhantomData,
++        merchant_id: processor.get_account().get_id().clone(),
++        customer_id: payment_intent.customer_id.to_owned(),
++        tenant_id: state.tenant.tenant_id.clone(),
++        connector: connector_id.to_string(),
++        payment_id: payment_attempt.payment_id.get_string_repr().to_owned(),
++        attempt_id: payment_attempt.attempt_id.clone(),
++        status: payment_attempt.status,
++        payment_method,
++        payment_method_type: payment_attempt.payment_method_type,
++        connector_auth_type: auth_type,
++        description: None,
++        address: PaymentAddress::default(),
++        auth_type: payment_attempt.authentication_type.unwrap_or_default(),
++        connector_meta_data: merchant_connector_account.get_metadata(),
++        connector_wallets_details: merchant_connector_account.get_connector_wallets_details(),
++        amount_captured: payment_intent
++            .amount_captured
++            .map(|amt| amt.get_amount_as_i64()),
++        payment_method_status: None,
++        minor_amount_captured: payment_intent.amount_captured,
++        request,
++        response: Err(types::ErrorResponse {
++            code: interfaces_consts::NO_ERROR_CODE.to_string(),
++            message: NOT_IMPLEMENTED_MESSAGE.to_string(),
++            reason: None,
++            status_code: 501,
++            attempt_status: None,
++            connector_transaction_id: None,
++            connector_response_reference_id: None,
++            network_decline_code: None,
++            network_advice_code: None,
++            network_error_message: None,
++            connector_metadata: None,
++        }),
++        access_token: None,
++        session_token: None,
++        reference_id: None,
++        payment_method_token: None,
++        connector_customer: None,
++        recurring_mandate_payment_data: None,
++        preprocessing_id: None,
++        // PayPal sends this as PayPal-Request-Id (idempotency): one id per (attempt, tracking number) so a retry of the same
++        // number is deduplicated by PayPal while a second shipment of the same order is not.
++        connector_request_reference_id: format!(
++            "{}-track-{}",
++            payment_attempt.attempt_id, tracking_number
++        ),
++        #[cfg(feature = "payouts")]
++        payout_method_data: None,
++        #[cfg(feature = "payouts")]
++        quote_id: None,
++        test_mode: merchant_connector_account.is_test_mode_on(),
++        payment_method_balance: None,
++        connector_api_version: None,
++        connector_http_status_code: None,
++        external_latency: None,
++        apple_pay_flow: None,
++        frm_metadata: None,
++        refund_id: None,
++        dispute_id: None,
++        payout_id: None,
++        connector_response: None,
++        integrity_check: Ok(()),
++        additional_merchant_data: None,
++        header_payload: None,
++        connector_mandate_request_reference_id: None,
++        authentication_id: None,
++        psd2_sca_exemption_type: None,
++        raw_connector_response: None,
++        is_payment_id_from_merchant: None,
++        l2_l3_data: None,
++        minor_amount_capturable: None,
++        authorized_amount: None,
++        customer_document_details: None,
++        feature_data: None,
++        sender_payment_instrument_id: None,
++    })
++}
+diff --git a/crates/router/src/routes/app.rs b/crates/router/src/routes/app.rs
+index 4b86a08..32cdcc5 100644
+--- a/crates/router/src/routes/app.rs
++++ b/crates/router/src/routes/app.rs
+@@ -1100,6 +1100,10 @@ impl Payments {
+                 .service(
+                     web::resource("{payment_id}/update_metadata")
+                         .route(web::post().to(payments::payments_update_metadata)),
++                )
++                .service(
++                    web::resource("{payment_id}/track")
++                        .route(web::post().to(payments::payments_track)),
+                 );
+         }
+         route
+diff --git a/crates/router/src/routes/lock_utils.rs b/crates/router/src/routes/lock_utils.rs
+index 62d4bd7..6d1f00d 100644
+--- a/crates/router/src/routes/lock_utils.rs
++++ b/crates/router/src/routes/lock_utils.rs
+@@ -188,6 +188,7 @@ impl From<Flow> for ApiIdentifier {
+             | Flow::ApplyPaymentMethodData
+             | Flow::PaymentsPostSessionTokens
+             | Flow::PaymentsUpdateMetadata
++            | Flow::PaymentsTrack
+             | Flow::PaymentsUpdateIntent
+             | Flow::PaymentsCreateAndConfirmIntent
+             | Flow::PaymentStartRedirection
+diff --git a/crates/router/src/routes/payments.rs b/crates/router/src/routes/payments.rs
+index 3a726d5..3de335f 100644
+--- a/crates/router/src/routes/payments.rs
++++ b/crates/router/src/routes/payments.rs
+@@ -951,6 +951,39 @@ pub async fn payments_post_session_tokens(
+     .await
+ }
+ 
++/// mergesk patch 0005 (plan 33): `POST /payments/{payment_id}/track` - send shipment tracking to the connector of a captured payment.
++#[cfg(feature = "v1")]
++#[instrument(skip_all, fields(flow = ?Flow::PaymentsTrack, payment_id))]
++pub async fn payments_track(
++    state: web::Data<app::AppState>,
++    req: actix_web::HttpRequest,
++    json_payload: web::Json<payment_types::PaymentsTrackRequest>,
++    path: web::Path<common_utils::id_type::PaymentId>,
++) -> impl Responder {
++    let flow = Flow::PaymentsTrack;
++    let payment_id = path.into_inner();
++    let payload = payment_types::PaymentsTrackRequest {
++        payment_id,
++        ..json_payload.into_inner()
++    };
++    tracing::Span::current().record("payment_id", payload.payment_id.get_string_repr());
++    Box::pin(api::server_wrap(
++        flow,
++        state,
++        &req,
++        payload,
++        |state, auth: auth::AuthenticationData, req, _| {
++            crate::core::track::payments_track_core(state, auth.platform, req)
++        },
++        &auth::HeaderAuth(auth::ApiKeyAuth {
++            allow_connected_scope_operation: true,
++            allow_platform_self_operation: false,
++        }),
++        api_locking::LockAction::NotApplicable,
++    ))
++    .await
++}
++
+ #[cfg(feature = "v1")]
+ #[instrument(skip_all, fields(flow = ?Flow::PaymentsUpdateMetadata, payment_id))]
+ pub async fn payments_update_metadata(
+diff --git a/crates/router/src/types.rs b/crates/router/src/types.rs
+index 3cec804..6315cf1 100644
+--- a/crates/router/src/types.rs
++++ b/crates/router/src/types.rs
+@@ -44,7 +44,8 @@ use hyperswitch_domain_models::router_flow_types::{
+         CreateConnectorCustomer, CreateOrder, ExtendAuthorization, ExternalVaultProxy, GenerateQr,
+         IncrementalAuthorization, InitPayment, PSync, PostCaptureVoid, PostCaptureVoidSync,
+         PostProcessing, PostSessionTokens, PreAuthorizeVoid, PreProcessing, PushNotification,
+-        Reject, SdkSessionUpdate, Session, SetupMandate, UpdateMetadata, UpdatePostConfirm, Void,
++        Reject, SdkSessionUpdate, Session, SetupMandate, Track, UpdateMetadata, UpdatePostConfirm,
++        Void,
+     },
+     refunds::{Execute, RSync},
+     webhooks::VerifyWebhookSource,
+@@ -89,7 +90,7 @@ pub use hyperswitch_domain_models::{
+         PaymentsPostAuthenticateData, PaymentsPostProcessingData, PaymentsPostSessionTokensData,
+         PaymentsPreAuthenticateData, PaymentsPreAuthorizeCancelData, PaymentsPreProcessingData,
+         PaymentsRejectData, PaymentsSessionData, PaymentsSurchargeCalculationData,
+-        PaymentsSyncData, PaymentsTaxCalculationData, PaymentsUpdateMetadataData,
++        PaymentsSyncData, PaymentsTaxCalculationData, PaymentsTrackData, PaymentsUpdateMetadataData,
+         PaymentsUpdatePostConfirmData, PushNotificationRequestData, RefundsData, ResponseId,
+         RetrieveFileRequestData, SdkPaymentsSessionUpdateData, SetupMandateRequestData,
+         SplitRefundsRequest, SubmitEvidenceRequestData, SyncRequestType, UploadFileRequestData,
+@@ -106,7 +107,8 @@ pub use hyperswitch_domain_models::{
+         AcceptDisputeResponse, CaptureSyncResponse, CompleteRefundSurchrgeResponseData,
+         CompleteSurchargeResponseData, DefendDisputeResponse, DisputeSyncResponse,
+         FetchDisputesResponse, MandateReference, MandateRevokeResponseData, PaymentsResponseData,
+-        PreprocessingResponseId, RefundsResponseData, RetrieveFileResponse, SubmitEvidenceResponse,
++        PaymentsTrackResponseData, PreprocessingResponseId, RefundsResponseData, RetrieveFileResponse,
++        SubmitEvidenceResponse,
+         SurchargeCalculationResponseData, TaxCalculationResponseData, UploadFileResponse,
+         VaultResponseData, VerifyWebhookSourceResponseData, VerifyWebhookStatus,
+     },
+@@ -129,8 +131,8 @@ pub use hyperswitch_interfaces::{
+         PaymentsBalanceType, PaymentsCaptureType, PaymentsCompleteAuthorizeType, PaymentsInitType,
+         PaymentsPostCaptureVoidType, PaymentsPostProcessingType, PaymentsPostSessionTokensType,
+         PaymentsPreAuthorizeType, PaymentsPreProcessingType, PaymentsPushNotificationType,
+-        PaymentsSessionType, PaymentsSyncType, PaymentsUpdateMetadataType, PaymentsVoidType,
+-        RefreshTokenType, RefundExecuteType, RefundSyncType, Response, RetrieveFileType,
++        PaymentsSessionType, PaymentsSyncType, PaymentsTrackType, PaymentsUpdateMetadataType,
++        PaymentsVoidType, RefreshTokenType, RefundExecuteType, RefundSyncType, Response, RetrieveFileType,
+         SdkSessionUpdateType, SetupMandateType, SubmitEvidenceType, TokenizationType,
+         UploadFileType, VerifyWebhookSourceType,
+     },
+@@ -201,6 +203,8 @@ pub type PaymentsPostSessionTokensRouterData =
+ 
+ pub type PaymentsUpdateMetadataRouterData =
+     RouterData<UpdateMetadata, PaymentsUpdateMetadataData, PaymentsResponseData>;
++/// mergesk patch 0005
++pub type PaymentsTrackRouterData = RouterData<Track, PaymentsTrackData, PaymentsTrackResponseData>;
+ 
+ pub type PaymentsUpdatePostConfirmRouterData =
+     RouterData<UpdatePostConfirm, PaymentsUpdatePostConfirmData, PaymentsResponseData>;
+diff --git a/crates/router/src/types/api/payments.rs b/crates/router/src/types/api/payments.rs
+index db178e8..bb024c0 100644
+--- a/crates/router/src/types/api/payments.rs
++++ b/crates/router/src/types/api/payments.rs
+@@ -30,7 +30,8 @@ pub use api_models::{
+         PaymentsPostSessionTokensResponse, PaymentsRedirectRequest, PaymentsRedirectionResponse,
+         PaymentsRejectRequest, PaymentsRequest, PaymentsResponse, PaymentsResponseForm,
+         PaymentsRetrieveRequest, PaymentsSessionRequest, PaymentsSessionResponse,
+-        PaymentsStartRequest, PaymentsUpdateMetadataRequest, PaymentsUpdateMetadataResponse,
++        PaymentsStartRequest, PaymentsTrackRequest, PaymentsTrackResponse,
++        PaymentsUpdateMetadataRequest, PaymentsUpdateMetadataResponse,
+         PgRedirectResponse, PhoneDetails, ProxyPaymentMethodData, ProxyPaymentMethodDataRequest,
+         RedirectionResponse, SessionToken, UrlDetails, VaultDetails, VaultSessionDetails,
+         VerifyRequest, VerifyResponse, VgsSessionDetails, WalletData,
+@@ -45,14 +46,15 @@ pub use hyperswitch_domain_models::router_flow_types::payments::{
+     IncrementalAuthorization, InitPayment, PSync, PaymentCreateIntent, PaymentGetIntent,
+     PaymentMethodToken, PaymentUpdateIntent, PostCaptureVoid, PostCaptureVoidSync, PostProcessing,
+     PostSessionTokens, PreAuthorizeVoid, PreProcessing, PushNotification, RecordAttempt, Reject,
+-    SdkSessionUpdate, Session, SetupMandate, UpdateMetadata, UpdatePostConfirm, Void,
++    SdkSessionUpdate, Session, SetupMandate, Track, UpdateMetadata, UpdatePostConfirm, Void,
+ };
+ pub use hyperswitch_interfaces::api::payments::{
+     ConnectorCustomer, MandateSetup, Payment, PaymentApprove, PaymentAuthorize,
+     PaymentAuthorizeSessionToken, PaymentCapture, PaymentIncrementalAuthorization,
+     PaymentPostCaptureVoid, PaymentPostCaptureVoidSync, PaymentPostSessionTokens, PaymentReject,
+     PaymentSession, PaymentSessionUpdate, PaymentSync, PaymentToken, PaymentUpdate,
+-    PaymentUpdateMetadata, PaymentVoid, PaymentsCompleteAuthorize, PaymentsCreateOrder,
++    PaymentTrack, PaymentUpdateMetadata, PaymentVoid, PaymentsCompleteAuthorize,
++    PaymentsCreateOrder,
+     PaymentsGenerateQr, PaymentsPostProcessing, PaymentsPreProcessing, PaymentsPushNotification,
+     SurchargeCalculation, SurchargeComplete, SurchargeRefund, TaxCalculation,
+ };
+@@ -63,7 +65,8 @@ pub use super::payments_v2::{
+     PaymentAuthorizeV2, PaymentCaptureV2, PaymentExtendAuthorizationV2,
+     PaymentIncrementalAuthorizationV2, PaymentPostCaptureVoidSyncV2, PaymentPostCaptureVoidV2,
+     PaymentPostSessionTokensV2, PaymentRejectV2, PaymentSessionUpdateV2, PaymentSessionV2,
+-    PaymentSyncV2, PaymentTokenV2, PaymentUpdateMetadataV2, PaymentV2, PaymentVoidV2,
++    PaymentSyncV2, PaymentTokenV2, PaymentTrackV2, PaymentUpdateMetadataV2, PaymentV2,
++    PaymentVoidV2,
+     PaymentsCompleteAuthorizeV2, PaymentsGenerateQrV2, PaymentsPostProcessingV2,
+     PaymentsPreProcessingV2, PaymentsPushNotificationV2, TaxCalculationV2,
+ };
+diff --git a/crates/router/src/types/api/payments_v2.rs b/crates/router/src/types/api/payments_v2.rs
+index c2d90bd..c38bc23 100644
+--- a/crates/router/src/types/api/payments_v2.rs
++++ b/crates/router/src/types/api/payments_v2.rs
+@@ -3,7 +3,8 @@ pub use hyperswitch_interfaces::api::payments_v2::{
+     PaymentAuthorizeV2, PaymentCaptureV2, PaymentExtendAuthorizationV2,
+     PaymentIncrementalAuthorizationV2, PaymentPostCaptureVoidSyncV2, PaymentPostCaptureVoidV2,
+     PaymentPostSessionTokensV2, PaymentRejectV2, PaymentSessionUpdateV2, PaymentSessionV2,
+-    PaymentSyncV2, PaymentTokenV2, PaymentUpdateMetadataV2, PaymentV2, PaymentVoidV2,
++    PaymentSyncV2, PaymentTokenV2, PaymentTrackV2, PaymentUpdateMetadataV2, PaymentV2,
++    PaymentVoidV2,
+     PaymentsCompleteAuthorizeV2, PaymentsGenerateQrV2, PaymentsPostProcessingV2,
+     PaymentsPreProcessingV2, PaymentsPushNotificationV2, TaxCalculationV2,
+ };
+diff --git a/crates/router_env/src/logger/types.rs b/crates/router_env/src/logger/types.rs
+index 2d61d95..7d50625 100644
+--- a/crates/router_env/src/logger/types.rs
++++ b/crates/router_env/src/logger/types.rs
+@@ -653,6 +653,8 @@ pub enum Flow {
+     PaymentsPostSessionTokens,
+     /// Payments Update Metadata
+     PaymentsUpdateMetadata,
++    /// Payments shipment tracking to the connector (mergesk patch 0005)
++    PaymentsTrack,
+     /// Payments start redirection flow
+     PaymentStartRedirection,
+     /// Volume split on the routing type
